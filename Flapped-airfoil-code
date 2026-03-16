@@ -1,1 +1,348 @@
-xxx
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+# Output folder and filename base for exported geometry
+OUT_DIR = r"C:/Users/sebsa/Desktop/FYP/Code/Hinged"
+BASENAME = "naca0012"
+
+# Airfoil geometry
+# CHORD is the airfoil chord length in mm
+# TC is the thickness-to-chord ratio (12% for NACA 0012)
+CHORD = 400.0
+TC = 0.12
+CLOSED_TE = True   # closed trailing edge option in the NACA thickness equation
+
+# Point distribution used to discretise the airfoil
+# Higher N_POINTS gives a smoother curve
+N_POINTS = 400
+COSINE_SPACING = True  # cosine spacing clusters more points near LE and TE
+
+# Hinge definition
+# HINGE_X_FRAC gives the hinge location as a fraction of chord
+# HINGE_Y_MM is the hinge vertical position in mm
+HINGE_X_FRAC = 0.50
+HINGE_Y_MM = 0.0  # lies on the centreline for symmetric NACA 0012
+
+# Flap deflection angle
+# Positive = upward rotation, negative = downward rotation
+HINGE_DEFLECT_DEG = -20.0
+
+# Transition mode for the flap motion:
+#   "sharp"  -> idealised discrete hinge at xh
+#   "smooth" -> gradual blend over a short distance aft of the hinge
+HINGE_MODE = "smooth"
+BLEND_WIDTH_FRAC = 0.02  # width of smooth transition as fraction of chord
+
+# Export settings for SolidWorks
+EXPORT_UPPER_LOWER = True
+EXPORT_LOOP = False
+
+# Plot settings
+FIG_DPI = 150
+SAVE_PNG = True
+
+
+# ============================================================
+# Utilities
+# ============================================================
+def cosine_x(n: int) -> np.ndarray:
+    """
+    Generates cosine-spaced x/c coordinates from 0 to 1.
+    This is commonly used for airfoil discretisation because it places
+    more points near the leading and trailing edges where curvature is high.
+    """
+    beta = np.linspace(0.0, np.pi, n)
+    return 0.5 * (1.0 - np.cos(beta))
+
+
+def uniform_x(n: int) -> np.ndarray:
+    """
+    Generates uniformly spaced x/c coordinates from 0 to 1.
+    """
+    return np.linspace(0.0, 1.0, n)
+
+
+def naca_thickness(x_over_c: np.ndarray, t: float, closed_te: bool = True) -> np.ndarray:
+    """
+    Computes the thickness distribution for a 4-digit NACA airfoil.
+
+    Inputs:
+        x_over_c   : non-dimensional chordwise coordinate
+        t          : thickness ratio (e.g. 0.12 for NACA 0012)
+        closed_te  : if True, use the coefficient for a closed trailing edge
+
+    Output:
+        Non-dimensional half-thickness distribution y_t/c
+    """
+    a0, a1, a2, a3 = 0.2969, -0.1260, -0.3516, 0.2843
+    a4 = -0.1036 if closed_te else -0.1015
+    x = np.clip(x_over_c, 0.0, 1.0)
+    return 5.0 * t * (a0*np.sqrt(x) + a1*x + a2*x**2 + a3*x**3 + a4*x**4)
+
+
+def smoothstep(u: np.ndarray) -> np.ndarray:
+    """
+    Smooth transition function varying from 0 to 1.
+    Used here to gradually introduce flap rotation over a finite blend region.
+    """
+    u = np.clip(u, 0.0, 1.0)
+    return 3*u**2 - 2*u**3
+
+
+def rotate_about_point_xy(x: np.ndarray, y: np.ndarray, x0: float, y0: float, theta_rad: np.ndarray):
+    """
+    Rotates a set of 2D points about a specified hinge point (x0, y0)
+    by angle theta_rad.
+    """
+    xr = x - x0
+    yr = y - y0
+    c = np.cos(theta_rad)
+    s = np.sin(theta_rad)
+    x_new = x0 + c * xr - s * yr
+    y_new = y0 + s * xr + c * yr
+    return x_new, y_new
+
+
+def make_closed_loop(xu, yu, xl, yl):
+    """
+    Combines upper and lower surface coordinates into a single closed loop.
+    This is useful for plotting the complete airfoil boundary.
+    """
+    return (
+        np.concatenate([xu[::-1], xl[1:]]),
+        np.concatenate([yu[::-1], yl[1:]]),
+    )
+
+
+def write_solidworks_txt_xyz(path: str, x: np.ndarray, y: np.ndarray):
+    """
+    Exports point coordinates in X Y Z format for SolidWorks:
+    Insert -> Curve -> Curve Through XYZ Points
+
+    Output format:
+    - ASCII text
+    - space delimited
+    - no header
+    - Z coordinate set to zero for all points
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    z = np.zeros_like(x)
+    np.savetxt(path, np.column_stack([x, y, z]), fmt="%.6f %.6f %.6f")
+
+
+def tangent_angles(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    Estimates the local tangent angle of a curve using numerical gradients.
+    This is later used to reconstruct the upper and lower surfaces normal
+    to the morphed centreline.
+    """
+    dx = np.gradient(x)
+    dy = np.gradient(y)
+    return np.arctan2(dy, dx)
+
+
+# ============================================================
+# Baseline and hinge centreline
+# ============================================================
+def build_baseline():
+    """
+    Builds the undeformed baseline NACA 0012 geometry.
+
+    Returns:
+        x_over_c : non-dimensional x coordinate
+        x        : dimensional x coordinate [mm]
+        yt       : dimensional half-thickness [mm]
+        x_c, y_c : baseline centreline coordinates
+    """
+    x_over_c = cosine_x(N_POINTS) if COSINE_SPACING else uniform_x(N_POINTS)
+    x = x_over_c * CHORD
+
+    # Compute NACA half-thickness distribution in mm
+    yt = naca_thickness(x_over_c, TC, closed_te=CLOSED_TE) * CHORD
+
+    # Enforce zero thickness at leading and trailing edge for numerical consistency
+    yt[0] = 0.0
+    yt[-1] = 0.0
+
+    # For a symmetric NACA 0012 airfoil the baseline centreline is horizontal
+    x_c = x.copy()
+    y_c = np.zeros_like(x)
+
+    return x_over_c, x, yt, x_c, y_c
+
+
+def morphed_centerline(x_over_c: np.ndarray, x_c: np.ndarray, y_c: np.ndarray):
+    """
+    Applies hinged flap deflection to the airfoil centreline.
+
+    The fore region (x <= hinge location) is intentionally locked so that
+    the front part of the airfoil remains exactly unchanged.
+    Only the aft region is rotated about the hinge point.
+
+    Two options are supported:
+    - sharp  : instant rotation aft of hinge
+    - smooth : gradual increase in rotation over a short blend region
+    """
+    xh = HINGE_X_FRAC * CHORD
+    yh = HINGE_Y_MM
+    theta_full = np.deg2rad(HINGE_DEFLECT_DEG)
+
+    # Weight function controlling how much local rotation is applied
+    # By construction, w = 0 ahead of the hinge
+    w = np.zeros_like(x_over_c, dtype=float)
+
+    if HINGE_MODE.lower().strip() == "sharp":
+        w[x_over_c > HINGE_X_FRAC] = 1.0
+
+    elif HINGE_MODE.lower().strip() == "smooth":
+        bw = max(float(BLEND_WIDTH_FRAC), 0.0)
+        if bw <= 0.0:
+            w[x_over_c > HINGE_X_FRAC] = 1.0
+        else:
+            x0 = HINGE_X_FRAC
+            x1 = min(HINGE_X_FRAC + bw, 1.0)
+
+            # Between x0 and x1, the rotation is blended smoothly
+            ramp = (x_over_c > x0) & (x_over_c < x1)
+            w[x_over_c >= x1] = 1.0
+            u = (x_over_c[ramp] - x0) / max((x1 - x0), 1e-12)
+            w[ramp] = smoothstep(u)
+    else:
+        raise ValueError("HINGE_MODE must be 'sharp' or 'smooth'.")
+
+    # Local rotation angle along the centreline
+    theta = theta_full * w
+
+    # Rotate centreline points about hinge
+    x_cm, y_cm = rotate_about_point_xy(x_c, y_c, xh, yh, theta)
+
+    # Explicitly hard-lock the fore region to guarantee exact agreement
+    # with the original airfoil ahead of the hinge
+    fore = x_over_c <= HINGE_X_FRAC
+    x_cm[fore] = x_c[fore]
+    y_cm[fore] = y_c[fore]
+
+    return x_cm, y_cm
+
+
+# ============================================================
+# Rebuild surfaces from centreline using thickness normal
+# ============================================================
+def rebuild_surfaces(x_over_c: np.ndarray, yt: np.ndarray, x_cm: np.ndarray, y_cm: np.ndarray):
+    """
+    Reconstructs the upper and lower airfoil surfaces from the morphed centreline.
+
+    The original local half-thickness is projected normal to the centreline.
+    This produces a deformed airfoil boundary while preserving the NACA 0012
+    thickness distribution along the transformed profile.
+
+    Ahead of the hinge, the tangent is forced to remain horizontal to ensure
+    the fore region is exactly identical to the baseline profile.
+    """
+    # Estimate tangent angle of morphed centreline
+    th = tangent_angles(x_cm, y_cm)
+
+    # Lock fore-region tangent so first 50% chord remains unchanged
+    fore = x_over_c <= HINGE_X_FRAC
+    th[fore] = 0.0
+
+    # Unit normal vector to centreline
+    nx = -np.sin(th)
+    ny =  np.cos(th)
+
+    # Offset upper and lower surfaces by the half-thickness
+    xu = x_cm + yt * nx
+    yu = y_cm + yt * ny
+    xl = x_cm - yt * nx
+    yl = y_cm - yt * ny
+
+    # Enforce consistency at leading and trailing edge
+    yu[0] = yl[0] = y_cm[0]
+    yu[-1] = yl[-1] = y_cm[-1]
+
+    return xu, yu, xl, yl
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    """
+    Main workflow:
+    1. Generate baseline NACA 0012 geometry
+    2. Morph the centreline using the hinge definition
+    3. Rebuild the upper and lower surfaces from the morphed centreline
+    4. Export coordinates for CAD use
+    5. Plot the baseline and deformed airfoils
+    """
+    x_over_c, x_base, yt, x_c, y_c = build_baseline()
+
+    # Baseline upper and lower surfaces
+    xu0, yu0 = x_base.copy(), +yt
+    xl0, yl0 = x_base.copy(), -yt
+
+    # Morphed centreline and corresponding rebuilt surfaces
+    x_cm, y_cm = morphed_centerline(x_over_c, x_c, y_c)
+    xu, yu, xl, yl = rebuild_surfaces(x_over_c, yt, x_cm, y_cm)
+
+    # Create closed loops for plotting
+    xb0, yb0 = make_closed_loop(xu0, yu0, xl0, yl0)
+    xb1, yb1 = make_closed_loop(xu,  yu,  xl,  yl)
+
+    # Quantitative verification:
+    # Check that the airfoil is unchanged ahead of the hinge location
+    fore = x_over_c <= HINGE_X_FRAC
+    max_fore_err = (
+        np.max(np.abs(xu[fore] - xu0[fore])) +
+        np.max(np.abs(yu[fore] - yu0[fore])) +
+        np.max(np.abs(xl[fore] - xl0[fore])) +
+        np.max(np.abs(yl[fore] - yl0[fore]))
+    )
+    print(f"Fore-region exactness check (x<=0.5c) | max combined |Δ| = {max_fore_err:.3e}")
+
+    # Export geometry for SolidWorks
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    if EXPORT_UPPER_LOWER:
+        up_path = os.path.join(OUT_DIR, f"{BASENAME}_{HINGE_DEFLECT_DEG:.1f}deg_{HINGE_MODE}_upper.txt")
+        lo_path = os.path.join(OUT_DIR, f"{BASENAME}_{HINGE_DEFLECT_DEG:.1f}deg_{HINGE_MODE}_lower.txt")
+        write_solidworks_txt_xyz(up_path, xu, yu)
+        write_solidworks_txt_xyz(lo_path, xl, yl)
+        print("Wrote:")
+        print(" ", up_path)
+        print(" ", lo_path)
+
+    if EXPORT_LOOP:
+        loop_path = os.path.join(OUT_DIR, f"{BASENAME}_{HINGE_DEFLECT_DEG:.1f}deg_{HINGE_MODE}_loop.txt")
+        write_solidworks_txt_xyz(loop_path, xb1, yb1)
+        print(" ", loop_path)
+
+    # Plot undeformed and deformed airfoil shape for visual comparison
+    xh_mm = HINGE_X_FRAC * CHORD
+    plt.figure(figsize=(9, 5))
+    plt.axis("equal")
+    plt.plot(xb0, yb0, label="Baseline")
+    plt.plot(xb1, yb1, label=f"Deflected {HINGE_DEFLECT_DEG:.1f}° | mode={HINGE_MODE}")
+    plt.plot(x_cm, y_cm, "--", linewidth=1.5, label="Morphed centreline")
+    plt.axvline(xh_mm, linestyle=":", linewidth=1, label="Hinge x")
+    plt.xlabel("x [mm]")
+    plt.ylabel("y [mm]")
+    plt.title(f"NACA 0012 hinged at x={HINGE_X_FRAC:.2f}c | smooth width={BLEND_WIDTH_FRAC:.3f}c")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+
+    if SAVE_PNG:
+        fig_path = os.path.join(OUT_DIR, f"{BASENAME}_{HINGE_DEFLECT_DEG:.1f}deg_{HINGE_MODE}.png")
+        plt.savefig(fig_path, dpi=FIG_DPI)
+        print("Plot saved:", fig_path)
+
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
