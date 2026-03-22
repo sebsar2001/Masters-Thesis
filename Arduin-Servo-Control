@@ -1,0 +1,130 @@
+#include <Servo.h>
+#include <EEPROM.h>
+
+
+
+Servo servoA;
+Servo servoB;
+
+const int SERVO_A_PIN = 9;
+const int SERVO_B_PIN = 10;
+
+const int SERVO_A_MIN = 0;
+const int SERVO_A_MAX = 180;
+
+const int SERVO_B_MIN = 0;
+const int SERVO_B_MAX = 180;
+
+const bool SERVO_B_INVERT = true;
+
+const int SERVO_A_OFFSET = 0;
+const int SERVO_B_OFFSET = 0;
+
+const int RAMP_STEP_DEG = 1;
+const int RAMP_DELAY_MS = 20;
+
+// ---------- EEPROM layout ----------
+const int EEPROM_MAGIC_ADDR = 0;   // 1 byte
+const int EEPROM_ANGLE_ADDR = 1;   // 1 byte
+const byte EEPROM_MAGIC = 0xA5;
+
+
+int currentCmd = 90;
+
+int clampInt(int x, int lo, int hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
+int mapToServoA(int cmd) {
+  cmd += SERVO_A_OFFSET;
+  return clampInt(cmd, SERVO_A_MIN, SERVO_A_MAX);
+}
+
+int mapToServoB(int cmd) {
+  cmd = clampInt(cmd, SERVO_A_MIN, SERVO_A_MAX);
+  int b = cmd;
+  if (SERVO_B_INVERT) b = SERVO_B_MIN + SERVO_B_MAX - cmd;
+  b += SERVO_B_OFFSET;
+  return clampInt(b, SERVO_B_MIN, SERVO_B_MAX);
+}
+
+void writeBoth(int cmd) {
+  servoA.write(mapToServoA(cmd));
+  servoB.write(mapToServoB(cmd));
+}
+
+void saveCmdToEEPROM(int cmd) {
+  cmd = clampInt(cmd, SERVO_A_MIN, SERVO_A_MAX);
+  // Only write if changed to reduce wear
+  byte stored = EEPROM.read(EEPROM_ANGLE_ADDR);
+  if (stored != (byte)cmd || EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC) {
+    EEPROM.update(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ANGLE_ADDR, (byte)cmd);
+  }
+}
+
+int loadCmdFromEEPROM(int fallbackCmd) {
+  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC) return fallbackCmd;
+  int cmd = (int)EEPROM.read(EEPROM_ANGLE_ADDR);
+  return clampInt(cmd, SERVO_A_MIN, SERVO_A_MAX);
+}
+
+void rampTo(int targetCmd) {
+  targetCmd = clampInt(targetCmd, SERVO_A_MIN, SERVO_A_MAX);
+  if (targetCmd == currentCmd) return;
+
+  int step = (targetCmd > currentCmd) ? RAMP_STEP_DEG : -RAMP_STEP_DEG;
+
+  for (int cmd = currentCmd; cmd != targetCmd; cmd += step) {
+    writeBoth(cmd);
+    delay(RAMP_DELAY_MS);
+  }
+
+  writeBoth(targetCmd);
+  currentCmd = targetCmd;
+  saveCmdToEEPROM(currentCmd);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  // 1) Read last command BEFORE attaching servos
+  currentCmd = loadCmdFromEEPROM(90);
+
+  // 2) Attach, then immediately command the stored position (minimizes jerk)
+  servoA.attach(SERVO_A_PIN);
+  servoB.attach(SERVO_B_PIN);
+  writeBoth(currentCmd);
+
+  Serial.println("Ready.");
+  Serial.print("Restored angle = ");
+  Serial.println(currentCmd);
+  Serial.println("Send an angle (0–180) and press Enter.");
+}
+
+void loop() {
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) return;
+
+    int cmd = line.toInt();
+    bool validZero = (line == "0");
+    if (!validZero && cmd == 0) {
+      Serial.println("Invalid input. Send a number 0–180.");
+      return;
+    }
+    if (cmd < SERVO_A_MIN || cmd > SERVO_A_MAX) {
+      Serial.println("Out of range. Send 0–180.");
+      return;
+    }
+
+    Serial.print("Commanded logical angle = ");
+    Serial.println(cmd);
+
+    rampTo(cmd);
+  }
+}
