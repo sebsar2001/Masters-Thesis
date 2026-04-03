@@ -1,0 +1,445 @@
+from odbAccess import openOdb
+import os
+import csv
+import re
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+WORK_DIR = r"C:\Users\sebsa\Desktop\Abaqus-Work\FYP2"
+OUT_DIR = os.path.join(WORK_DIR, "pressure_extracted")
+
+# Match files like:
+#   pressure-5-on.odb
+#   pressure-10-on.odb
+#   pressure-25-on.odb
+ODB_REGEX = r"^pressure-(\d+)-on\.odb$"
+
+# Step names
+PRESSURE_STEP_NAME = "Pressures"
+DISPLACEMENT_STEP_NAME = "displacement"
+
+# Spring element set name in assembly
+SPRING_ELSET_NAME = "SPRING-ELEM"
+
+# History outputs to extract from the pressure step
+# These labels are only output filenames; matching is done from available ODB regions/variables
+HISTORY_TARGETS = {
+    "RP-history": ["U1", "U2", "RF1", "RF2"],
+    "Upper-history": ["U1", "U2"],
+    "Lower-history": ["U1", "U2"],
+    "TE-history": ["U1", "U2"],   # will warn if TE history is not actually present
+}
+
+# ============================================================
+# HELPERS
+# ============================================================
+def ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+def norm(s):
+    return str(s).upper().replace("-", "").replace("_", "").replace(" ", "")
+
+def extract_angle_from_filename(filename):
+    m = re.match(ODB_REGEX, filename, flags=re.IGNORECASE)
+    if not m:
+        return None
+    return float(m.group(1))
+
+def find_step(odb, requested_name):
+    for step_name in odb.steps.keys():
+        if norm(step_name) == norm(requested_name):
+            return step_name, odb.steps[step_name]
+    return None, None
+
+def find_assembly_elset(assembly, requested_name):
+    for name in assembly.elementSets.keys():
+        if norm(name) == norm(requested_name):
+            return name, assembly.elementSets[name]
+    return None, None
+
+def find_history_output(region, var_name):
+    target = norm(var_name)
+
+    # exact normalized match
+    for key, ho in region.historyOutputs.items():
+        if norm(key) == target:
+            return key, ho
+
+    # substring match
+    for key, ho in region.historyOutputs.items():
+        if target in norm(key):
+            return key, ho
+
+    return None, None
+
+def classify_region(region_name, region, vars_needed):
+    """
+    Heuristic classification score for matching history regions.
+    """
+    score = 0
+    name_n = norm(region_name)
+
+    # Variable availability
+    available = 0
+    for v in vars_needed:
+        _, ho = find_history_output(region, v)
+        if ho is not None:
+            available += 1
+    score += 100 * available
+
+    # Prefer node regions
+    if "NODE" in name_n:
+        score += 20
+
+    return score
+
+def find_best_history_region(step, label, vars_needed):
+    """
+    Finds the most likely region for the requested label.
+    """
+    best_name = None
+    best_region = None
+    best_score = -10**9
+
+    for region_name, region in step.historyRegions.items():
+        score = classify_region(region_name, region, vars_needed)
+        rn = norm(region_name)
+        lbl = norm(label)
+
+        # Boost likely matches based on region naming
+        if "RPHISTORY" in lbl or "RPHISTORY" == lbl:
+            if "DISPLACEMENT" in rn or "ASSEMBLY." in rn:
+                score += 40
+            if "RF1" in [norm(k) for k in region.historyOutputs.keys()]:
+                score += 40
+
+        elif "UPPERHISTORY" in lbl or "UPPER" in lbl:
+            if "UPPER" in rn:
+                score += 60
+
+        elif "LOWERHISTORY" in lbl or "LOWER" in lbl:
+            if "LOWER" in rn:
+                score += 60
+
+        elif "TEHISTORY" in lbl or "TE" in lbl:
+            if "TE" in rn:
+                score += 80
+
+        if score > best_score:
+            best_score = score
+            best_name = region_name
+            best_region = region
+
+    return best_name, best_region, best_score
+
+def write_history_region_csv(step, label, region_name, region, vars_needed, out_dir, odb_tag):
+    if region is None:
+        print("WARNING: No region found for", label)
+        return None
+
+    series = {}
+    for v in vars_needed:
+        key, ho = find_history_output(region, v)
+        if ho is not None:
+            series[v] = ho.data
+        else:
+            print("WARNING: Variable '{}' not found in region '{}'".format(v, region_name))
+
+    if not series:
+        print("WARNING: No requested variables available for", label)
+        return None
+
+    time_map = {}
+    for v, data in series.items():
+        for t, value in data:
+            if t not in time_map:
+                time_map[t] = {}
+            time_map[t][v] = value
+
+    times = sorted(time_map.keys())
+
+    out_path = os.path.join(out_dir, "{}_{}_{}.csv".format(odb_tag, step.name, label.replace(" ", "_")))
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        header = ["ODB", "StepName", "RegionName", "Time"] + vars_needed
+        writer.writerow(header)
+
+        for t in times:
+            row = [odb_tag, step.name, region_name, t]
+            for v in vars_needed:
+                row.append(time_map[t].get(v, ""))
+            writer.writerow(row)
+
+    print("Wrote:", out_path)
+    return out_path
+
+def get_field_subset(frame, field_name, region):
+    if field_name not in frame.fieldOutputs:
+        return None
+    return frame.fieldOutputs[field_name].getSubset(region=region)
+
+def safe_get_mises(val):
+    try:
+        return float(val.mises)
+    except Exception:
+        return None
+
+def safe_get_max_principal(val):
+    try:
+        return float(val.maxPrincipal)
+    except Exception:
+        return None
+
+def extract_spring_maxima(step, spring_region, out_dir, odb_tag):
+    rows = []
+
+    for i, frame in enumerate(step.frames):
+        row = {
+            "FrameIndex": i,
+            "FrameTime": frame.frameValue,
+            "MaxMises": None,
+            "MaxPrincipalStress": None,
+            "MaxPrincipalStrain": None,
+        }
+
+        s_subset = get_field_subset(frame, "S", spring_region)
+        if s_subset is not None and len(s_subset.values) > 0:
+            mises_vals = []
+            p1_vals = []
+
+            for val in s_subset.values:
+                vm = safe_get_mises(val)
+                p1 = safe_get_max_principal(val)
+                if vm is not None:
+                    mises_vals.append(vm)
+                if p1 is not None:
+                    p1_vals.append(p1)
+
+            if mises_vals:
+                row["MaxMises"] = max(mises_vals)
+            if p1_vals:
+                row["MaxPrincipalStress"] = max(p1_vals)
+
+        le_subset = get_field_subset(frame, "LE", spring_region)
+        if le_subset is not None and len(le_subset.values) > 0:
+            le_p1_vals = []
+            for val in le_subset.values:
+                p1 = safe_get_max_principal(val)
+                if p1 is not None:
+                    le_p1_vals.append(p1)
+
+            if le_p1_vals:
+                row["MaxPrincipalStrain"] = max(le_p1_vals)
+
+        rows.append(row)
+
+    out_path = os.path.join(out_dir, "{}_{}_spring_maxima.csv".format(odb_tag, step.name))
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ODB", "FrameIndex", "FrameTime", "MaxMises", "MaxPrincipalStress", "MaxPrincipalStrain"])
+        for r in rows:
+            writer.writerow([
+                odb_tag,
+                r["FrameIndex"],
+                r["FrameTime"],
+                r["MaxMises"],
+                r["MaxPrincipalStress"],
+                r["MaxPrincipalStrain"],
+            ])
+    print("Wrote:", out_path)
+
+    final_summary_path = None
+    if rows:
+        final = rows[-1]
+        final_summary_path = os.path.join(out_dir, "{}_{}_spring_final_summary.csv".format(odb_tag, step.name))
+        with open(final_summary_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["ODB", "FinalFrameIndex", "FinalTime", "MaxMises", "MaxPrincipalStress", "MaxPrincipalStrain"])
+            writer.writerow([
+                odb_tag,
+                final["FrameIndex"],
+                final["FrameTime"],
+                final["MaxMises"],
+                final["MaxPrincipalStress"],
+                final["MaxPrincipalStrain"],
+            ])
+        print("Wrote:", final_summary_path)
+
+    return out_path, final_summary_path
+
+def dump_available_history_regions(step, out_dir, odb_tag):
+    out_path = os.path.join(out_dir, "{}_{}_available_history_regions.txt".format(odb_tag, step.name))
+    with open(out_path, "w") as f:
+        f.write("ODB: {}\n".format(odb_tag))
+        f.write("STEP: {}\n".format(step.name))
+        f.write("=" * 70 + "\n")
+        for region_name, region in step.historyRegions.items():
+            f.write("REGION: {}\n".format(region_name))
+            outs = sorted(region.historyOutputs.keys())
+            for key in outs:
+                f.write("   {}\n".format(key))
+    print("Wrote:", out_path)
+
+def read_last_row(csv_path):
+    if csv_path is None or (not os.path.exists(csv_path)):
+        return None, None
+    with open(csv_path, "r") as f:
+        rows = list(csv.reader(f))
+    if len(rows) < 2:
+        return rows[0], None
+    return rows[0], rows[-1]
+
+# ============================================================
+# MAIN PER ODB
+# ============================================================
+def process_odb(odb_path, out_dir):
+    odb_name = os.path.basename(odb_path)
+    odb_tag = os.path.splitext(odb_name)[0]
+    angle_deg = extract_angle_from_filename(odb_name)
+
+    print("")
+    print("=" * 80)
+    print("Processing:", odb_name)
+    print("=" * 80)
+
+    odb = openOdb(path=odb_path, readOnly=True)
+
+    try:
+        pressure_step_name, pressure_step = find_step(odb, PRESSURE_STEP_NAME)
+        if pressure_step is None:
+            raise ValueError("Could not find pressure step '{}' in {}".format(PRESSURE_STEP_NAME, odb_name))
+
+        # Optional
+        displacement_step_name, displacement_step = find_step(odb, DISPLACEMENT_STEP_NAME)
+
+        dump_available_history_regions(pressure_step, out_dir, odb_tag)
+
+        history_summary_rows = []
+        extracted_history_csvs = {}
+
+        for label, vars_needed in HISTORY_TARGETS.items():
+            region_name, region, score = find_best_history_region(pressure_step, label, vars_needed)
+
+            if region is None or score < 100:
+                print("WARNING: Could not confidently find history region for '{}' in {}".format(label, odb_name))
+                continue
+
+            print("Matched '{}' to region '{}' with score {}".format(label, region_name, score))
+
+            csv_path = write_history_region_csv(
+                step=pressure_step,
+                label=label,
+                region_name=region_name,
+                region=region,
+                vars_needed=vars_needed,
+                out_dir=out_dir,
+                odb_tag=odb_tag
+            )
+
+            extracted_history_csvs[label] = csv_path
+            history_summary_rows.append([odb_tag, label, region_name, score, len(vars_needed), csv_path])
+
+        summary_path = os.path.join(out_dir, "{}_history_region_matches.csv".format(odb_tag))
+        with open(summary_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["ODB", "Label", "MatchedRegion", "Score", "RequestedVariables", "CSV"])
+            for row in history_summary_rows:
+                writer.writerow(row)
+        print("Wrote:", summary_path)
+
+        spring_name, spring_region = find_assembly_elset(odb.rootAssembly, SPRING_ELSET_NAME)
+        spring_max_csv = None
+        spring_final_csv = None
+
+        if spring_region is None:
+            print("WARNING: Could not find spring element set '{}' in {}".format(SPRING_ELSET_NAME, odb_name))
+        else:
+            print("Using spring element set:", spring_name)
+            spring_max_csv, spring_final_csv = extract_spring_maxima(pressure_step, spring_region, out_dir, odb_tag)
+
+        # Build one-line summary row from final values
+        rp_header, rp_last = read_last_row(extracted_history_csvs.get("RP-history"))
+        te_header, te_last = read_last_row(extracted_history_csvs.get("TE-history"))
+        up_header, up_last = read_last_row(extracted_history_csvs.get("Upper-history"))
+        lo_header, lo_last = read_last_row(extracted_history_csvs.get("Lower-history"))
+        sp_header, sp_last = read_last_row(spring_final_csv)
+
+        def get_from_row(header, row, key):
+            if header is None or row is None:
+                return ""
+            if key not in header:
+                return ""
+            return row[header.index(key)]
+
+        summary_row = {
+            "ODB": odb_tag,
+            "Angle_deg": angle_deg if angle_deg is not None else "",
+            "PressureStep": pressure_step_name,
+            "FinalTime_PressureStep": pressure_step.frames[-1].frameValue if len(pressure_step.frames) > 0 else "",
+            "RP_U1": get_from_row(rp_header, rp_last, "U1"),
+            "RP_U2": get_from_row(rp_header, rp_last, "U2"),
+            "RP_RF1": get_from_row(rp_header, rp_last, "RF1"),
+            "RP_RF2": get_from_row(rp_header, rp_last, "RF2"),
+            "TE_U1": get_from_row(te_header, te_last, "U1"),
+            "TE_U2": get_from_row(te_header, te_last, "U2"),
+            "Upper_U1": get_from_row(up_header, up_last, "U1"),
+            "Upper_U2": get_from_row(up_header, up_last, "U2"),
+            "Lower_U1": get_from_row(lo_header, lo_last, "U1"),
+            "Lower_U2": get_from_row(lo_header, lo_last, "U2"),
+            "Spring_MaxMises": get_from_row(sp_header, sp_last, "MaxMises"),
+            "Spring_MaxPrincipalStress": get_from_row(sp_header, sp_last, "MaxPrincipalStress"),
+            "Spring_MaxPrincipalStrain": get_from_row(sp_header, sp_last, "MaxPrincipalStrain"),
+        }
+
+        return summary_row
+
+    finally:
+        odb.close()
+        print("ODB closed:", odb_name)
+
+# ============================================================
+# MAIN BATCH
+# ============================================================
+def main():
+    ensure_dir(OUT_DIR)
+
+    odb_files = []
+    for name in os.listdir(WORK_DIR):
+        if re.match(ODB_REGEX, name, flags=re.IGNORECASE):
+            odb_files.append(name)
+
+    odb_files = sorted(odb_files, key=lambda n: extract_angle_from_filename(n) if extract_angle_from_filename(n) is not None else 1e9)
+
+    if not odb_files:
+        raise RuntimeError("No ODB files matching '{}' found in {}".format(ODB_REGEX, WORK_DIR))
+
+    all_summary_rows = []
+    for odb_name in odb_files:
+        odb_path = os.path.join(WORK_DIR, odb_name)
+        row = process_odb(odb_path, OUT_DIR)
+        all_summary_rows.append(row)
+
+    combined_summary_path = os.path.join(OUT_DIR, "pressure_batch_summary.csv")
+    keys = [
+        "ODB", "Angle_deg", "PressureStep", "FinalTime_PressureStep",
+        "RP_U1", "RP_U2", "RP_RF1", "RP_RF2",
+        "TE_U1", "TE_U2",
+        "Upper_U1", "Upper_U2",
+        "Lower_U1", "Lower_U2",
+        "Spring_MaxMises", "Spring_MaxPrincipalStress", "Spring_MaxPrincipalStrain",
+    ]
+
+    with open(combined_summary_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for row in all_summary_rows:
+            writer.writerow(row)
+
+    print("")
+    print("Done.")
+    print("Combined summary written to:", combined_summary_path)
+
+if __name__ == "__main__":
+    main()
