@@ -1,0 +1,318 @@
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+BASE_DIR = Path(r"C:/Users/sebsa/Desktop/FYP/FEA/Springs/20mm/spring_rib_exports")
+CFD_XLSX = Path(r"C:/Users/sebsa/Desktop/FYP/FEA/CFD-pressures2.xlsx")
+OUT_DIR = BASE_DIR / "cfd_nodal_loads"
+
+# 2D model thickness
+THICKNESS_MM = 200.0
+
+# Chord used for x/c mapping
+CHORD_MM = 400.0
+
+# If your Abaqus input file uses assembly instance names, keep this False
+# and use the actual instance names from the exported CSVs.
+FORCE_SINGLE_INSTANCE_NAME = False
+SINGLE_INSTANCE_NAME = "SKIN-1"
+
+# ============================================================
+# HELPERS
+# ============================================================
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+def extract_angle_from_sheet(sheet_name: str):
+    m = re.fullmatch(r"(\d+)\s*deg", sheet_name.strip(), flags=re.IGNORECASE)
+    if not m:
+        return None
+    return int(m.group(1))
+
+def case_name_from_angle(angle_deg: int) -> str:
+    return f"REF_{angle_deg}DEG"
+
+def norm_text(s: str) -> str:
+    return str(s).upper().replace("-", "_").replace(" ", "_")
+
+def find_surface_csv(case_name: str, surface: str, base_dir: Path) -> Path:
+    """
+    surface must be 'UPPER_SURF' or 'LOWER_SURF'
+    Finds exactly one matching CSV for the case.
+    """
+    case_norm = norm_text(case_name)
+    surf_norm = norm_text(surface)
+
+    matches = []
+    for p in base_dir.glob("*.csv"):
+        name_norm = norm_text(p.name)
+        if name_norm.startswith(case_norm + "_") and surf_norm in name_norm:
+            matches.append(p)
+
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"Expected 1 {surface} CSV for {case_name}, found {len(matches)}: {[p.name for p in matches]}"
+        )
+    return matches[0]
+
+def load_surface_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing surface CSV: {path}")
+
+    df = pd.read_csv(path)
+    required = {"Instance", "NodeLabel", "X_def", "Y_def"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path.name} missing columns: {missing}")
+
+    out = df[["Instance", "NodeLabel", "X_def", "Y_def"]].copy()
+    out = out.rename(columns={"X_def": "x", "Y_def": "y"})
+    out["Instance"] = out["Instance"].astype(str).str.strip()
+    out["NodeLabel"] = out["NodeLabel"].astype(int)
+
+    out = (
+        out.sort_values(["x", "y", "NodeLabel"])
+        .drop_duplicates(subset=["Instance", "NodeLabel"])
+        .reset_index(drop=True)
+    )
+    return out
+
+def load_cfd_sheet(xlsx_path: Path, sheet_name: str) -> pd.DataFrame:
+    """
+    Reads the CFD pressure sheet and resolves duplicate pressure columns.
+    Header row expected at Excel row 4 (index 3).
+    """
+    raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None)
+
+    headers = raw.iloc[3].tolist()
+    data = raw.iloc[4:].copy()
+    data.columns = headers
+
+    def get_last_column(df, col_name):
+        matches = [i for i, c in enumerate(df.columns) if c == col_name]
+        if not matches:
+            raise ValueError(f"Sheet '{sheet_name}' missing column '{col_name}'")
+        return df.iloc[:, matches[-1]]
+
+    out = pd.DataFrame({
+        "Segment start x/c": pd.to_numeric(get_last_column(data, "Segment start x/c"), errors="coerce"),
+        "Segment end x/c": pd.to_numeric(get_last_column(data, "Segment end x/c"), errors="coerce"),
+        "Segment mid x/c": pd.to_numeric(get_last_column(data, "Segment mid x/c"), errors="coerce"),
+        "Lower pressure (Pa)": pd.to_numeric(get_last_column(data, "Lower pressure (Pa)"), errors="coerce"),
+        "Upper pressure (Pa)": pd.to_numeric(get_last_column(data, "Upper pressure (Pa)"), errors="coerce"),
+    })
+
+    out = out.dropna(subset=["Segment mid x/c", "Lower pressure (Pa)", "Upper pressure (Pa)"])
+    out = out.sort_values("Segment mid x/c").reset_index(drop=True)
+    return out
+
+def interpolate_pressure_to_nodes(surface_df: pd.DataFrame, xcp, pvals):
+    x_c = surface_df["x"].to_numpy(dtype=float) / CHORD_MM
+    xcp = np.asarray(xcp, dtype=float).ravel()
+    pvals = np.asarray(pvals, dtype=float).ravel()
+
+    p_node = np.interp(x_c, xcp, pvals, left=pvals[0], right=pvals[-1])
+    return x_c, p_node
+
+def segment_nodal_forces(surface_df: pd.DataFrame, p_node: np.ndarray, is_upper: bool) -> pd.DataFrame:
+    x = surface_df["x"].to_numpy(dtype=float)
+    y = surface_df["y"].to_numpy(dtype=float)
+    labels = surface_df["NodeLabel"].to_numpy(dtype=int)
+    instances = surface_df["Instance"].to_numpy(dtype=str)
+
+    fx = np.zeros(len(surface_df), dtype=float)
+    fy = np.zeros(len(surface_df), dtype=float)
+
+    for i in range(len(surface_df) - 1):
+        dx = x[i + 1] - x[i]
+        dy = y[i + 1] - y[i]
+        L = np.hypot(dx, dy)
+        if L <= 1e-12:
+            continue
+
+        tx = dx / L
+        ty = dy / L
+
+        nx = -ty
+        ny = tx
+
+        # choose outward normal
+        if is_upper:
+            if ny < 0.0:
+                nx *= -1.0
+                ny *= -1.0
+        else:
+            if ny > 0.0:
+                nx *= -1.0
+                ny *= -1.0
+
+        p_avg = 0.5 * (p_node[i] + p_node[i + 1])
+
+        # pressure acts inward on the structure
+        fseg = -p_avg * L * THICKNESS_MM
+
+        fx_i = 0.5 * fseg * nx
+        fy_i = 0.5 * fseg * ny
+
+        fx[i] += fx_i
+        fy[i] += fy_i
+        fx[i + 1] += fx_i
+        fy[i + 1] += fy_i
+
+    out = pd.DataFrame({
+        "Instance": instances,
+        "NodeLabel": labels,
+        "x": x,
+        "y": y,
+        "Fx": fx,
+        "Fy": fy,
+    })
+    return out
+
+def write_cload_include(load_df: pd.DataFrame, out_path: Path):
+    with open(out_path, "w", newline="") as f:
+        f.write("** CFD-derived nodal loads\n")
+        f.write("*Cload\n")
+        for _, row in load_df.iterrows():
+            instance_name = SINGLE_INSTANCE_NAME if FORCE_SINGLE_INSTANCE_NAME else str(row["Instance"]).strip()
+            node = int(row["NodeLabel"])
+            fx = float(row["Fx"])
+            fy = float(row["Fy"])
+
+            if abs(fx) > 1e-12:
+                f.write(f"{instance_name}.{node}, 1, {fx:.12g}\n")
+            if abs(fy) > 1e-12:
+                f.write(f"{instance_name}.{node}, 2, {fy:.12g}\n")
+
+def discover_cases(cfd_xlsx: Path, base_dir: Path):
+    xls = pd.ExcelFile(cfd_xlsx)
+    discovered = []
+
+    for sheet in xls.sheet_names:
+        angle = extract_angle_from_sheet(sheet)
+        if angle is None:
+            continue
+
+        case_name = case_name_from_angle(angle)
+
+        try:
+            upper_csv = find_surface_csv(case_name, "UPPER_SURF", base_dir)
+            lower_csv = find_surface_csv(case_name, "LOWER_SURF", base_dir)
+        except FileNotFoundError as e:
+            print(f"Skipping {sheet}: {e}")
+            continue
+
+        discovered.append({
+            "sheet_name": sheet,
+            "angle_deg": angle,
+            "case_name": case_name,
+            "upper_csv": upper_csv,
+            "lower_csv": lower_csv,
+        })
+
+    discovered = sorted(discovered, key=lambda d: d["angle_deg"])
+    return discovered
+
+def process_case(case_info: dict, cfd_xlsx: Path, out_dir: Path):
+    sheet_name = case_info["sheet_name"]
+    case_name = case_info["case_name"]
+
+    upper = load_surface_csv(case_info["upper_csv"])
+    lower = load_surface_csv(case_info["lower_csv"])
+    cfd = load_cfd_sheet(cfd_xlsx, sheet_name)
+
+    xcp = cfd["Segment mid x/c"].to_numpy(dtype=float)
+
+    # Pa -> N/mm^2 for mm-N model
+    p_lower = cfd["Lower pressure (Pa)"].to_numpy(dtype=float) * 1e-6
+    p_upper = cfd["Upper pressure (Pa)"].to_numpy(dtype=float) * 1e-6
+
+    upper["x_over_c"], upper["p_N_per_mm2"] = interpolate_pressure_to_nodes(upper, xcp, p_upper)
+    lower["x_over_c"], lower["p_N_per_mm2"] = interpolate_pressure_to_nodes(lower, xcp, p_lower)
+
+    upper_forces = segment_nodal_forces(upper, upper["p_N_per_mm2"].to_numpy(), is_upper=True)
+    lower_forces = segment_nodal_forces(lower, lower["p_N_per_mm2"].to_numpy(), is_upper=False)
+
+    upper_forces["Surface"] = "upper"
+    lower_forces["Surface"] = "lower"
+
+    upper_forces.to_csv(out_dir / f"{sheet_name}_upper_nodal_forces.csv", index=False)
+    lower_forces.to_csv(out_dir / f"{sheet_name}_lower_nodal_forces.csv", index=False)
+
+    all_forces = pd.concat([upper_forces, lower_forces], ignore_index=True)
+    all_forces = (
+        all_forces.groupby(["Instance", "NodeLabel"], as_index=False)
+        .agg({
+            "x": "first",
+            "y": "first",
+            "Fx": "sum",
+            "Fy": "sum"
+        })
+        .sort_values(["Instance", "NodeLabel"])
+        .reset_index(drop=True)
+    )
+
+    csv_out = out_dir / f"{sheet_name}_nodal_loads.csv"
+    all_forces.to_csv(csv_out, index=False)
+
+    inp_out = out_dir / f"{sheet_name}_cload.inp"
+    write_cload_include(all_forces, inp_out)
+
+    upper.to_csv(out_dir / f"{sheet_name}_upper_mapped_pressures.csv", index=False)
+    lower.to_csv(out_dir / f"{sheet_name}_lower_mapped_pressures.csv", index=False)
+
+    fx_sum = all_forces["Fx"].sum()
+    fy_sum = all_forces["Fy"].sum()
+    fres = float(np.hypot(fx_sum, fy_sum))
+
+    print(f"{sheet_name}:")
+    print(f"  case = {case_name}")
+    print(f"  upper = {case_info['upper_csv'].name}")
+    print(f"  lower = {case_info['lower_csv'].name}")
+    print(f"  wrote {csv_out.name}")
+    print(f"  wrote {inp_out.name}")
+    print(f"  total Fx = {fx_sum:.6f} N")
+    print(f"  total Fy = {fy_sum:.6f} N")
+    print(f"  total Fres = {fres:.6f} N")
+    print(f"  instances loaded = {sorted(all_forces['Instance'].unique().tolist())}")
+
+    return {
+        "Sheet": sheet_name,
+        "Angle_deg": case_info["angle_deg"],
+        "Case": case_name,
+        "UpperCSV": case_info["upper_csv"].name,
+        "LowerCSV": case_info["lower_csv"].name,
+        "Fx_total_N": fx_sum,
+        "Fy_total_N": fy_sum,
+        "F_resultant_N": fres,
+        "N_loaded_nodes": len(all_forces),
+    }
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    ensure_dir(OUT_DIR)
+
+    discovered_cases = discover_cases(CFD_XLSX, BASE_DIR)
+    if not discovered_cases:
+        raise RuntimeError("No matching CFD sheets and surface CSV pairs were found.")
+
+    summary_rows = []
+    for case_info in discovered_cases:
+        summary_rows.append(process_case(case_info, CFD_XLSX, OUT_DIR))
+
+    summary_df = pd.DataFrame(summary_rows).sort_values("Angle_deg").reset_index(drop=True)
+    summary_df.to_csv(OUT_DIR / "cfd_load_resultant_summary.csv", index=False)
+
+    print("")
+    print("Done.")
+    print(f"Processed deflections: {summary_df['Angle_deg'].tolist()}")
+    print(f"Outputs written to: {OUT_DIR}")
+
+if __name__ == "__main__":
+    main()
