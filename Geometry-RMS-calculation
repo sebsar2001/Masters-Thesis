@@ -1,0 +1,465 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+ABAQUS_DIR = Path(r"C:/Users/sebsa/Desktop/Abaqus-Work/FYP2/extracted_cases")
+TARGET_DIR = Path(r"C:/Users/sebsa/Desktop/Abaqus-Work/FYP2/target_airfoils")
+OUT_DIR = Path(r"C:/Users/sebsa/Desktop/Abaqus-Work/FYP2/rms_comparison_out")
+
+# Geometry scales
+FEA_CHORD_MM = 500.0
+TARGET_CHORD_MM = 400.0
+SCALE_FEA_TO_TARGET = TARGET_CHORD_MM / FEA_CHORD_MM   # 0.8
+
+TARGET_FILES = {
+    "5DEG":  "Circular_morph_5.0deg.txt",
+    "10DEG": "Circular_morph_10.0deg.txt",
+    "15DEG": "Circular_morph_15.0deg.txt",
+    "20DEG": "Circular_morph_20.0deg.txt",
+    "25DEG": "Circular_morph_25.0deg.txt",
+    "30DEG": "Circular_morph_30.0deg.txt",
+}
+
+# Target-airfoil skin-covered region, defined on TARGET chord
+UPPER_SEGMENT_XC = (0.525, 0.94)
+LOWER_SEGMENT_XC = (0.500, 0.94)
+
+# Numerical comparison alignment
+# "none"      -> raw comparison
+# "start"     -> match first point only
+# "two_point" -> remove linear offset between first and last point
+ALIGNMENT_MODE = "start"
+
+# Outputs
+SAVE_PLOTS = True
+SAVE_POINTWISE_CSVS = True
+
+# ============================================================
+# HELPERS
+# ============================================================
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+def rms(arr):
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    return float(np.sqrt(np.mean(arr**2)))
+
+def max_abs(arr):
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    return float(np.max(np.abs(arr)))
+
+def load_target_airfoil(path: Path):
+    df = pd.read_csv(
+        path,
+        sep=r"\s+",
+        header=None,
+        names=["x", "y", "z"],
+        engine="python",
+    )
+    return df[["x", "y"]].dropna().copy()
+
+def split_target_upper_lower(df):
+    le_idx = df["x"].idxmin()
+    le_pos = df.index.get_loc(le_idx)
+
+    part1 = df.iloc[:le_pos + 1].copy()
+    part2 = df.iloc[le_pos:].copy()
+
+    part1 = part1.sort_values("x").drop_duplicates(subset="x")
+    part2 = part2.sort_values("x").drop_duplicates(subset="x")
+
+    if part1["y"].mean() >= part2["y"].mean():
+        upper = part1.rename(columns={"x": "x_tgt", "y": "y_tgt"}).reset_index(drop=True)
+        lower = part2.rename(columns={"x": "x_tgt", "y": "y_tgt"}).reset_index(drop=True)
+    else:
+        upper = part2.rename(columns={"x": "x_tgt", "y": "y_tgt"}).reset_index(drop=True)
+        lower = part1.rename(columns={"x": "x_tgt", "y": "y_tgt"}).reset_index(drop=True)
+
+    return upper, lower
+
+def crop_target_segment(surface_df, xc_range, chord_mm):
+    xmin = xc_range[0] * chord_mm
+    xmax = xc_range[1] * chord_mm
+    out = surface_df[(surface_df["x_tgt"] >= xmin) & (surface_df["x_tgt"] <= xmax)].copy()
+    out = out.sort_values("x_tgt").drop_duplicates(subset="x_tgt")
+    return out.reset_index(drop=True)
+
+def load_abaqus_surface_csv(path: Path):
+    df = pd.read_csv(path)
+    required = {"NodeLabel", "X", "Y", "X_def", "Y_def"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path.name} missing columns: {missing}")
+
+    df = df[["NodeLabel", "X", "Y", "X_def", "Y_def"]].copy()
+    df = df.rename(columns={
+        "X": "x0",
+        "Y": "y0",
+        "X_def": "x_def",
+        "Y_def": "y_def",
+    })
+
+    # Order by undeformed x for stable node ordering along the skin
+    df = df.sort_values("x0").drop_duplicates(subset="x0")
+    return df.reset_index(drop=True)
+
+def add_arc_length_parameter(df, xcol, ycol, scol="s"):
+    out = df.copy()
+    x = out[xcol].to_numpy()
+    y = out[ycol].to_numpy()
+
+    ds = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
+    s = np.concatenate([[0.0], np.cumsum(ds)])
+
+    if s[-1] <= 1e-12:
+        raise ValueError(f"Zero arc length for {xcol}, {ycol}")
+
+    out[scol] = s / s[-1]
+    return out
+
+def align_curve(y_fea, y_tgt, s, mode="start"):
+    y_fea = np.asarray(y_fea, dtype=float)
+    y_tgt = np.asarray(y_tgt, dtype=float)
+    s = np.asarray(s, dtype=float)
+
+    if mode == "none":
+        correction = np.zeros_like(y_fea)
+        return y_fea.copy(), correction
+
+    if mode == "start":
+        offset = y_fea[0] - y_tgt[0]
+        correction = np.full_like(y_fea, offset)
+        return y_fea - correction, correction
+
+    if mode == "two_point":
+        start_off = y_fea[0] - y_tgt[0]
+        end_off = y_fea[-1] - y_tgt[-1]
+        correction = start_off + (end_off - start_off) * s
+        return y_fea - correction, correction
+
+    raise ValueError(f"Unknown ALIGNMENT_MODE: {mode}")
+
+def find_case_files(case_label: str, abaqus_dir: Path):
+    case_upper = case_label.upper()
+    upper_matches = []
+    lower_matches = []
+
+    for p in abaqus_dir.glob("*.csv"):
+        name_upper = p.name.upper()
+        if name_upper.startswith(f"{case_upper}_") and "UPPER_NODES" in name_upper:
+            upper_matches.append(p)
+        elif name_upper.startswith(f"{case_upper}_") and "LOWER_NODES" in name_upper:
+            lower_matches.append(p)
+
+    if len(upper_matches) != 1:
+        raise FileNotFoundError(
+            f"Expected 1 upper CSV for {case_label}, found {len(upper_matches)}: {[p.name for p in upper_matches]}"
+        )
+    if len(lower_matches) != 1:
+        raise FileNotFoundError(
+            f"Expected 1 lower CSV for {case_label}, found {len(lower_matches)}: {[p.name for p in lower_matches]}"
+        )
+
+    return upper_matches[0], lower_matches[0]
+
+# ============================================================
+# PLOTTING
+# ============================================================
+def make_visual_overlay_plot(
+    tgt_upper_full,
+    tgt_lower_full,
+    tgt_upper_seg,
+    tgt_lower_seg,
+    fea_upper_plot,
+    fea_lower_plot,
+    out_path
+):
+    plt.figure(figsize=(8, 4.8))
+
+    plt.plot(
+        tgt_upper_full["x_tgt"] / TARGET_CHORD_MM,
+        tgt_upper_full["y_tgt"] / TARGET_CHORD_MM,
+        linewidth=1.4,
+        label="Target upper (full)"
+    )
+    plt.plot(
+        tgt_lower_full["x_tgt"] / TARGET_CHORD_MM,
+        tgt_lower_full["y_tgt"] / TARGET_CHORD_MM,
+        linewidth=1.4,
+        label="Target lower (full)"
+    )
+
+    plt.plot(
+        tgt_upper_seg["x_tgt"] / TARGET_CHORD_MM,
+        tgt_upper_seg["y_tgt"] / TARGET_CHORD_MM,
+        marker="o",
+        markersize=2.2,
+        linewidth=1.0,
+        label="Target upper segment"
+    )
+    plt.plot(
+        tgt_lower_seg["x_tgt"] / TARGET_CHORD_MM,
+        tgt_lower_seg["y_tgt"] / TARGET_CHORD_MM,
+        marker="o",
+        markersize=2.2,
+        linewidth=1.0,
+        label="Target lower segment"
+    )
+
+    plt.plot(
+        fea_upper_plot["x_plot"] / TARGET_CHORD_MM,
+        fea_upper_plot["y_plot"] / TARGET_CHORD_MM,
+        "--",
+        linewidth=2.0,
+        label="FEA upper (scaled+shifted)"
+    )
+    plt.plot(
+        fea_lower_plot["x_plot"] / TARGET_CHORD_MM,
+        fea_lower_plot["y_plot"] / TARGET_CHORD_MM,
+        "--",
+        linewidth=2.0,
+        label="FEA lower (scaled+shifted)"
+    )
+
+    plt.xlabel("x/c")
+    plt.ylabel("y/c")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+def make_node_comparison_plot(
+    s_upper, y_tgt_upper, y_fea_upper,
+    s_lower, y_tgt_lower, y_fea_lower,
+    out_path
+):
+    plt.figure(figsize=(8, 4.8))
+    plt.plot(s_upper, y_tgt_upper, marker="o", markersize=3, linewidth=1.2, label="Target upper on FEA nodes")
+    plt.plot(s_lower, y_tgt_lower, marker="o", markersize=3, linewidth=1.2, label="Target lower on FEA nodes")
+    plt.plot(s_upper, y_fea_upper, "--", linewidth=2.0, label="FEA upper aligned")
+    plt.plot(s_lower, y_fea_lower, "--", linewidth=2.0, label="FEA lower aligned")
+    plt.xlabel("Local skin coordinate, s")
+    plt.ylabel("y/c")
+    plt.xlim(0.0, 1.0)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+def make_error_plot(s_upper, err_upper, s_lower, err_lower, out_path):
+    plt.figure(figsize=(8, 4.8))
+    plt.plot(s_upper, err_upper, label="Upper error")
+    plt.plot(s_lower, err_lower, label="Lower error")
+    plt.xlabel("Local skin coordinate, s")
+    plt.ylabel("Δ(y/c)")
+    plt.xlim(0.0, 1.0)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    ensure_dir(OUT_DIR)
+    summary_rows = []
+
+    for case_label, target_filename in TARGET_FILES.items():
+        print(f"Processing {case_label}...")
+
+        upper_csv_path, lower_csv_path = find_case_files(case_label, ABAQUS_DIR)
+        target_path = TARGET_DIR / target_filename
+
+        if not target_path.exists():
+            raise FileNotFoundError(f"Target file not found: {target_path}")
+
+        # --------------------------
+        # Load FEA morphed skin
+        # --------------------------
+        fea_upper = load_abaqus_surface_csv(upper_csv_path)
+        fea_lower = load_abaqus_surface_csv(lower_csv_path)
+
+        # Scale both undeformed and deformed FEA geometry into target geometry space
+        fea_upper["x0_scaled"] = fea_upper["x0"] * SCALE_FEA_TO_TARGET
+        fea_upper["y0_scaled"] = fea_upper["y0"] * SCALE_FEA_TO_TARGET
+        fea_upper["xdef_scaled"] = fea_upper["x_def"] * SCALE_FEA_TO_TARGET
+        fea_upper["ydef_scaled"] = fea_upper["y_def"] * SCALE_FEA_TO_TARGET
+
+        fea_lower["x0_scaled"] = fea_lower["x0"] * SCALE_FEA_TO_TARGET
+        fea_lower["y0_scaled"] = fea_lower["y0"] * SCALE_FEA_TO_TARGET
+        fea_lower["xdef_scaled"] = fea_lower["x_def"] * SCALE_FEA_TO_TARGET
+        fea_lower["ydef_scaled"] = fea_lower["y_def"] * SCALE_FEA_TO_TARGET
+
+        # --------------------------
+        # Load and prepare target
+        # --------------------------
+        target_full = load_target_airfoil(target_path)
+        tgt_upper_full, tgt_lower_full = split_target_upper_lower(target_full)
+
+        tgt_upper_seg = crop_target_segment(tgt_upper_full, UPPER_SEGMENT_XC, TARGET_CHORD_MM)
+        tgt_lower_seg = crop_target_segment(tgt_lower_full, LOWER_SEGMENT_XC, TARGET_CHORD_MM)
+
+        # --------------------------
+        # Shift FEA into target reference frame using UNDEFORMED starts
+        # --------------------------
+        upper_x_shift = tgt_upper_seg["x_tgt"].iloc[0] - fea_upper["x0_scaled"].iloc[0]
+        lower_x_shift = tgt_lower_seg["x_tgt"].iloc[0] - fea_lower["x0_scaled"].iloc[0]
+
+        upper_y_shift = tgt_upper_seg["y_tgt"].iloc[0] - fea_upper["y0_scaled"].iloc[0]
+        lower_y_shift = tgt_lower_seg["y_tgt"].iloc[0] - fea_lower["y0_scaled"].iloc[0]
+
+        # Undeformed
+        fea_upper["x0_plot"] = fea_upper["x0_scaled"] + upper_x_shift
+        fea_upper["y0_plot"] = fea_upper["y0_scaled"] + upper_y_shift
+        fea_lower["x0_plot"] = fea_lower["x0_scaled"] + lower_x_shift
+        fea_lower["y0_plot"] = fea_lower["y0_scaled"] + lower_y_shift
+
+        # Deformed
+        fea_upper["x_plot"] = fea_upper["xdef_scaled"] + upper_x_shift
+        fea_upper["y_plot"] = fea_upper["ydef_scaled"] + upper_y_shift
+        fea_lower["x_plot"] = fea_lower["xdef_scaled"] + lower_x_shift
+        fea_lower["y_plot"] = fea_lower["ydef_scaled"] + lower_y_shift
+
+        # --------------------------
+        # Numerical comparison setup
+        # Compare target segment against DEFORMED FEA skin
+        # --------------------------
+        fea_upper_cmp = add_arc_length_parameter(fea_upper, "x_plot", "y_plot", "s")
+        fea_lower_cmp = add_arc_length_parameter(fea_lower, "x_plot", "y_plot", "s")
+        tgt_upper_cmp = add_arc_length_parameter(tgt_upper_seg, "x_tgt", "y_tgt", "s")
+        tgt_lower_cmp = add_arc_length_parameter(tgt_lower_seg, "x_tgt", "y_tgt", "s")
+
+        # Normalize y by TARGET chord because everything is now in target geometry space
+        fea_upper_cmp["y_plot_c"] = fea_upper_cmp["y_plot"] / TARGET_CHORD_MM
+        fea_lower_cmp["y_plot_c"] = fea_lower_cmp["y_plot"] / TARGET_CHORD_MM
+        tgt_upper_cmp["y_tgt_c"] = tgt_upper_cmp["y_tgt"] / TARGET_CHORD_MM
+        tgt_lower_cmp["y_tgt_c"] = tgt_lower_cmp["y_tgt"] / TARGET_CHORD_MM
+
+        # Interpolate target only onto exact FEA node positions
+        y_tgt_upper_on_fea = np.interp(
+            fea_upper_cmp["s"].to_numpy(),
+            tgt_upper_cmp["s"].to_numpy(),
+            tgt_upper_cmp["y_tgt_c"].to_numpy()
+        )
+        y_tgt_lower_on_fea = np.interp(
+            fea_lower_cmp["s"].to_numpy(),
+            tgt_lower_cmp["s"].to_numpy(),
+            tgt_lower_cmp["y_tgt_c"].to_numpy()
+        )
+
+        # Additional alignment for numerical comparison
+        y_fea_upper_aligned, upper_correction = align_curve(
+            fea_upper_cmp["y_plot_c"].to_numpy(),
+            y_tgt_upper_on_fea,
+            fea_upper_cmp["s"].to_numpy(),
+            ALIGNMENT_MODE
+        )
+        y_fea_lower_aligned, lower_correction = align_curve(
+            fea_lower_cmp["y_plot_c"].to_numpy(),
+            y_tgt_lower_on_fea,
+            fea_lower_cmp["s"].to_numpy(),
+            ALIGNMENT_MODE
+        )
+
+        # Errors at FEA nodes only
+        err_upper_c = y_fea_upper_aligned - y_tgt_upper_on_fea
+        err_lower_c = y_fea_lower_aligned - y_tgt_lower_on_fea
+        err_combined_c = np.concatenate([err_upper_c, err_lower_c])
+
+        err_upper_mm = err_upper_c * TARGET_CHORD_MM
+        err_lower_mm = err_lower_c * TARGET_CHORD_MM
+        err_combined_mm = err_combined_c * TARGET_CHORD_MM
+
+        # --------------------------
+        # Save outputs
+        # --------------------------
+        if SAVE_POINTWISE_CSVS:
+            upper_out = fea_upper_cmp.copy()
+            upper_out["y_target_c_on_fea_nodes"] = y_tgt_upper_on_fea
+            upper_out["y_fea_c_aligned"] = y_fea_upper_aligned
+            upper_out["alignment_correction_c"] = upper_correction
+            upper_out["dy_c"] = err_upper_c
+            upper_out["dy_mm_equiv"] = err_upper_mm
+            upper_out.to_csv(OUT_DIR / f"{case_label}_upper_pointwise.csv", index=False)
+
+            lower_out = fea_lower_cmp.copy()
+            lower_out["y_target_c_on_fea_nodes"] = y_tgt_lower_on_fea
+            lower_out["y_fea_c_aligned"] = y_fea_lower_aligned
+            lower_out["alignment_correction_c"] = lower_correction
+            lower_out["dy_c"] = err_lower_c
+            lower_out["dy_mm_equiv"] = err_lower_mm
+            lower_out.to_csv(OUT_DIR / f"{case_label}_lower_pointwise.csv", index=False)
+
+        summary_rows.append({
+            "Case": case_label,
+            "ALIGNMENT_MODE": ALIGNMENT_MODE,
+            "FEA_Chord_mm": FEA_CHORD_MM,
+            "Target_Chord_mm": TARGET_CHORD_MM,
+            "Scale_FEA_to_Target": SCALE_FEA_TO_TARGET,
+            "Upper_X_Shift_mm": upper_x_shift,
+            "Lower_X_Shift_mm": lower_x_shift,
+            "Upper_Y_Shift_mm": upper_y_shift,
+            "Lower_Y_Shift_mm": lower_y_shift,
+            "Upper_Target_xc_min": UPPER_SEGMENT_XC[0],
+            "Upper_Target_xc_max": UPPER_SEGMENT_XC[1],
+            "Lower_Target_xc_min": LOWER_SEGMENT_XC[0],
+            "Lower_Target_xc_max": LOWER_SEGMENT_XC[1],
+            "Upper_RMS_y_over_c": rms(err_upper_c),
+            "Lower_RMS_y_over_c": rms(err_lower_c),
+            "Combined_RMS_y_over_c": rms(err_combined_c),
+            "Upper_MaxAbs_y_over_c": max_abs(err_upper_c),
+            "Lower_MaxAbs_y_over_c": max_abs(err_lower_c),
+            "Combined_MaxAbs_y_over_c": max_abs(err_combined_c),
+            "Upper_RMS_mm_equiv": rms(err_upper_mm),
+            "Lower_RMS_mm_equiv": rms(err_lower_mm),
+            "Combined_RMS_mm_equiv": rms(err_combined_mm),
+            "Upper_MaxAbs_mm_equiv": max_abs(err_upper_mm),
+            "Lower_MaxAbs_mm_equiv": max_abs(err_lower_mm),
+            "Combined_MaxAbs_mm_equiv": max_abs(err_combined_mm),
+            "N_upper": len(err_upper_c),
+            "N_lower": len(err_lower_c),
+            "Upper_CSV": upper_csv_path.name,
+            "Lower_CSV": lower_csv_path.name,
+            "Target_File": target_filename,
+        })
+
+        if SAVE_PLOTS:
+            make_visual_overlay_plot(
+                tgt_upper_full,
+                tgt_lower_full,
+                tgt_upper_seg,
+                tgt_lower_seg,
+                fea_upper,
+                fea_lower,
+                OUT_DIR / f"{case_label}_visual_overlay.png"
+            )
+
+            make_node_comparison_plot(
+                fea_upper_cmp["s"].to_numpy(), y_tgt_upper_on_fea, y_fea_upper_aligned,
+                fea_lower_cmp["s"].to_numpy(), y_tgt_lower_on_fea, y_fea_lower_aligned,
+                OUT_DIR / f"{case_label}_node_comparison.png"
+            )
+
+            make_error_plot(
+                fea_upper_cmp["s"].to_numpy(), err_upper_c,
+                fea_lower_cmp["s"].to_numpy(), err_lower_c,
+                OUT_DIR / f"{case_label}_error.png"
+            )
+
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv(OUT_DIR / "rms_summary.csv", index=False)
+
+    print("Done.")
+    print(f"Summary: {OUT_DIR / 'rms_summary.csv'}")
+
+if __name__ == "__main__":
+    main()
