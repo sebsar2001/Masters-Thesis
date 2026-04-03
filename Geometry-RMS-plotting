@@ -1,0 +1,437 @@
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import re
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+ABAQUS_DIR = Path(r"C:/Users/sebsa/Desktop/Abaqus-Work/FYP2/extracted_cases")
+TARGET_DIR = Path(r"C:/Users/sebsa/Desktop/Abaqus-Work/FYP2/target_airfoils")
+OUT_DIR = Path(r"C:/Users/sebsa/Desktop/Abaqus-Work/FYP2/centerline_rms_out")
+
+# Geometry scales
+FEA_CHORD_MM = 500.0
+TARGET_CHORD_MM = 400.0
+SCALE_FEA_TO_TARGET = TARGET_CHORD_MM / FEA_CHORD_MM   # 0.8
+
+TARGET_FILES = {
+    "5DEG":  "Circular_morph_5.0deg.txt",
+    "10DEG": "Circular_morph_10.0deg.txt",
+    "15DEG": "Circular_morph_15.0deg.txt",
+    "20DEG": "Circular_morph_20.0deg.txt",
+    "25DEG": "Circular_morph_25.0deg.txt",
+    "30DEG": "Circular_morph_30.0deg.txt",
+}
+
+# Target-airfoil skin-covered region, defined on TARGET chord
+UPPER_SEGMENT_XC = (0.525, 0.94)
+LOWER_SEGMENT_XC = (0.500, 0.94)
+
+# Alignment for centerline comparison:
+# "none"      -> raw comparison
+# "start"     -> match first point only
+# "two_point" -> remove linear offset between first and last point
+ALIGNMENT_MODE = "start"
+
+# Plot styling
+FIG_W = 7.0
+FIG_H = 4.8
+LABEL_FS = 14
+TICK_FS = 13
+LEGEND_FS = 11
+LINE_W = 2.0
+MARKER_SZ = 3
+
+SAVE_PLOTS = True
+SAVE_POINTWISE_CSVS = True
+
+# Summary plot settings
+SUMMARY_Y_COL = "Centerline_RMS_mm"          # or "Centerline_RMS_y_over_c"
+SUMMARY_Y_LABEL = "Centerline RMS [mm]"      # or "Centerline RMS [y/c]"
+
+# ============================================================
+# HELPERS
+# ============================================================
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+def rms(arr):
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    return float(np.sqrt(np.mean(arr**2)))
+
+def max_abs(arr):
+    arr = np.asarray(arr, dtype=float)
+    if arr.size == 0:
+        return np.nan
+    return float(np.max(np.abs(arr)))
+
+def norm_text(s):
+    return s.upper().replace("-", "_").replace(" ", "_")
+
+def load_target_airfoil(path: Path):
+    df = pd.read_csv(
+        path,
+        sep=r"\s+",
+        header=None,
+        names=["x", "y", "z"],
+        engine="python",
+    )
+    return df[["x", "y"]].dropna().copy()
+
+def split_target_upper_lower(df):
+    le_idx = df["x"].idxmin()
+    le_pos = df.index.get_loc(le_idx)
+
+    part1 = df.iloc[:le_pos + 1].copy()
+    part2 = df.iloc[le_pos:].copy()
+
+    part1 = part1.sort_values("x").drop_duplicates(subset="x")
+    part2 = part2.sort_values("x").drop_duplicates(subset="x")
+
+    if part1["y"].mean() >= part2["y"].mean():
+        upper = part1.rename(columns={"x": "x_tgt", "y": "y_tgt"}).reset_index(drop=True)
+        lower = part2.rename(columns={"x": "x_tgt", "y": "y_tgt"}).reset_index(drop=True)
+    else:
+        upper = part2.rename(columns={"x": "x_tgt", "y": "y_tgt"}).reset_index(drop=True)
+        lower = part1.rename(columns={"x": "x_tgt", "y": "y_tgt"}).reset_index(drop=True)
+
+    return upper, lower
+
+def crop_target_segment(surface_df, xc_range, chord_mm):
+    xmin = xc_range[0] * chord_mm
+    xmax = xc_range[1] * chord_mm
+    out = surface_df[(surface_df["x_tgt"] >= xmin) & (surface_df["x_tgt"] <= xmax)].copy()
+    out = out.sort_values("x_tgt").drop_duplicates(subset="x_tgt")
+    return out.reset_index(drop=True)
+
+def load_abaqus_surface_csv(path: Path):
+    df = pd.read_csv(path)
+    required = {"NodeLabel", "X", "Y", "X_def", "Y_def"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path.name} missing columns: {missing}")
+
+    df = df[["NodeLabel", "X", "Y", "X_def", "Y_def"]].copy()
+    df = df.rename(columns={
+        "X": "x0",
+        "Y": "y0",
+        "X_def": "x_def",
+        "Y_def": "y_def",
+    })
+    df = df.sort_values("x0").drop_duplicates(subset="x0")
+    return df.reset_index(drop=True)
+
+def find_case_files(case_label: str, abaqus_dir: Path):
+    case_upper = case_label.upper()
+    upper_matches = []
+    lower_matches = []
+
+    for p in abaqus_dir.glob("*.csv"):
+        name_upper = p.name.upper()
+        if name_upper.startswith(f"{case_upper}_") and "UPPER_NODES" in name_upper:
+            upper_matches.append(p)
+        elif name_upper.startswith(f"{case_upper}_") and "LOWER_NODES" in name_upper:
+            lower_matches.append(p)
+
+    if len(upper_matches) != 1:
+        raise FileNotFoundError(
+            f"Expected 1 upper CSV for {case_label}, found {len(upper_matches)}: {[p.name for p in upper_matches]}"
+        )
+    if len(lower_matches) != 1:
+        raise FileNotFoundError(
+            f"Expected 1 lower CSV for {case_label}, found {len(lower_matches)}: {[p.name for p in lower_matches]}"
+        )
+
+    return upper_matches[0], lower_matches[0]
+
+def add_arc_length_parameter(df, xcol, ycol, scol="s"):
+    out = df.copy()
+    x = out[xcol].to_numpy()
+    y = out[ycol].to_numpy()
+
+    ds = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
+    s = np.concatenate([[0.0], np.cumsum(ds)])
+
+    if s[-1] <= 1e-12:
+        raise ValueError(f"Zero arc length for {xcol}, {ycol}")
+
+    out[scol] = s / s[-1]
+    return out
+
+def align_curve(y_fea, y_tgt, s, mode="start"):
+    y_fea = np.asarray(y_fea, dtype=float)
+    y_tgt = np.asarray(y_tgt, dtype=float)
+    s = np.asarray(s, dtype=float)
+
+    if mode == "none":
+        correction = np.zeros_like(y_fea)
+        return y_fea.copy(), correction
+
+    if mode == "start":
+        offset = y_fea[0] - y_tgt[0]
+        correction = np.full_like(y_fea, offset)
+        return y_fea - correction, correction
+
+    if mode == "two_point":
+        start_off = y_fea[0] - y_tgt[0]
+        end_off = y_fea[-1] - y_tgt[-1]
+        correction = start_off + (end_off - start_off) * s
+        return y_fea - correction, correction
+
+    raise ValueError(f"Unknown ALIGNMENT_MODE: {mode}")
+
+def style_axes(ax):
+    ax.grid(False)
+    ax.tick_params(axis="both", labelsize=TICK_FS)
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.0)
+
+def build_target_centerline(tgt_upper_seg, tgt_lower_seg):
+    tgt_upper_cmp = add_arc_length_parameter(tgt_upper_seg, "x_tgt", "y_tgt", "s")
+    tgt_lower_cmp = add_arc_length_parameter(tgt_lower_seg, "x_tgt", "y_tgt", "s")
+
+    s_common = np.linspace(0.0, 1.0, 400)
+
+    x_up = np.interp(s_common, tgt_upper_cmp["s"], tgt_upper_cmp["x_tgt"])
+    y_up = np.interp(s_common, tgt_upper_cmp["s"], tgt_upper_cmp["y_tgt"])
+
+    x_lo = np.interp(s_common, tgt_lower_cmp["s"], tgt_lower_cmp["x_tgt"])
+    y_lo = np.interp(s_common, tgt_lower_cmp["s"], tgt_lower_cmp["y_tgt"])
+
+    center = pd.DataFrame({
+        "s": s_common,
+        "x_center": 0.5 * (x_up + x_lo),
+        "y_center": 0.5 * (y_up + y_lo),
+    })
+    return center
+
+def build_fea_centerline(fea_upper, fea_lower):
+    up = add_arc_length_parameter(fea_upper, "x_plot", "y_plot", "s")
+    lo = add_arc_length_parameter(fea_lower, "x_plot", "y_plot", "s")
+
+    n_common = min(len(up), len(lo))
+    s_common = np.linspace(0.0, 1.0, n_common)
+
+    x_up = np.interp(s_common, up["s"], up["x_plot"])
+    y_up = np.interp(s_common, up["s"], up["y_plot"])
+
+    x_lo = np.interp(s_common, lo["s"], lo["x_plot"])
+    y_lo = np.interp(s_common, lo["s"], lo["y_plot"])
+
+    center = pd.DataFrame({
+        "s": s_common,
+        "x_center": 0.5 * (x_up + x_lo),
+        "y_center": 0.5 * (y_up + y_lo),
+    })
+    return center
+
+def extract_angle(case_name: str) -> float:
+    match = re.search(r"(\d+)", str(case_name))
+    if not match:
+        raise ValueError(f"Could not extract angle from Case value: {case_name}")
+    return float(match.group(1))
+
+def make_centerline_overlay_plot(case_label, tgt_center, fea_center, out_path):
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+
+    ax.plot(
+        tgt_center["s"],
+        tgt_center["y_center"] / TARGET_CHORD_MM,
+        linewidth=1.5,
+        marker="o",
+        markersize=MARKER_SZ,
+        label="Target centerline"
+    )
+    ax.plot(
+        fea_center["s"],
+        fea_center["y_center_aligned"] / TARGET_CHORD_MM,
+        linewidth=LINE_W,
+        linestyle="--",
+        label="FEA centerline"
+    )
+
+    ax.set_xlabel("Local centerline coordinate, s", fontsize=LABEL_FS)
+    ax.set_ylabel("y/c", fontsize=LABEL_FS)
+    ax.set_xlim(0.0, 1.0)
+    style_axes(ax)
+    ax.legend(fontsize=LEGEND_FS, frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+def make_centerline_error_plot(case_label, fea_center, err_c, out_path):
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+
+    ax.plot(
+        fea_center["s"],
+        err_c,
+        linewidth=LINE_W
+    )
+
+    ax.set_xlabel("Local centerline coordinate, s", fontsize=LABEL_FS)
+    ax.set_ylabel("Δ(y/c)", fontsize=LABEL_FS)
+    ax.set_xlim(0.0, 1.0)
+    style_axes(ax)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+def make_centerline_rms_vs_deflection_plot(summary_df, out_path):
+    df = summary_df.copy()
+    df["DeflectionAngle_deg"] = df["Case"].apply(extract_angle)
+    df = df.sort_values("DeflectionAngle_deg").reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_H))
+
+    ax.plot(
+        df["DeflectionAngle_deg"],
+        df[SUMMARY_Y_COL],
+        linewidth=LINE_W,
+        marker="o",
+        markersize=5
+    )
+
+    ax.set_xlabel("Deflection angle [deg]", fontsize=LABEL_FS)
+    ax.set_ylabel(SUMMARY_Y_LABEL, fontsize=LABEL_FS)
+    style_axes(ax)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    ensure_dir(OUT_DIR)
+    summary_rows = []
+
+    for case_label, target_filename in TARGET_FILES.items():
+        print(f"Processing {case_label}...")
+
+        upper_csv_path, lower_csv_path = find_case_files(case_label, ABAQUS_DIR)
+        target_path = TARGET_DIR / target_filename
+
+        if not target_path.exists():
+            raise FileNotFoundError(f"Target file not found: {target_path}")
+
+        # Load FEA surfaces
+        fea_upper = load_abaqus_surface_csv(upper_csv_path)
+        fea_lower = load_abaqus_surface_csv(lower_csv_path)
+
+        # Scale undeformed and deformed FEA geometry into target geometry space
+        for df in (fea_upper, fea_lower):
+            df["x0_scaled"] = df["x0"] * SCALE_FEA_TO_TARGET
+            df["y0_scaled"] = df["y0"] * SCALE_FEA_TO_TARGET
+            df["xdef_scaled"] = df["x_def"] * SCALE_FEA_TO_TARGET
+            df["ydef_scaled"] = df["y_def"] * SCALE_FEA_TO_TARGET
+
+        # Load target airfoil
+        target_full = load_target_airfoil(target_path)
+        tgt_upper_full, tgt_lower_full = split_target_upper_lower(target_full)
+
+        tgt_upper_seg = crop_target_segment(tgt_upper_full, UPPER_SEGMENT_XC, TARGET_CHORD_MM)
+        tgt_lower_seg = crop_target_segment(tgt_lower_full, LOWER_SEGMENT_XC, TARGET_CHORD_MM)
+
+        # Shift FEA into target frame using undeformed starts
+        upper_x_shift = tgt_upper_seg["x_tgt"].iloc[0] - fea_upper["x0_scaled"].iloc[0]
+        lower_x_shift = tgt_lower_seg["x_tgt"].iloc[0] - fea_lower["x0_scaled"].iloc[0]
+
+        upper_y_shift = tgt_upper_seg["y_tgt"].iloc[0] - fea_upper["y0_scaled"].iloc[0]
+        lower_y_shift = tgt_lower_seg["y_tgt"].iloc[0] - fea_lower["y0_scaled"].iloc[0]
+
+        fea_upper["x_plot"] = fea_upper["xdef_scaled"] + upper_x_shift
+        fea_upper["y_plot"] = fea_upper["ydef_scaled"] + upper_y_shift
+        fea_lower["x_plot"] = fea_lower["xdef_scaled"] + lower_x_shift
+        fea_lower["y_plot"] = fea_lower["ydef_scaled"] + lower_y_shift
+
+        # Build centerlines
+        tgt_center = build_target_centerline(tgt_upper_seg, tgt_lower_seg)
+        fea_center = build_fea_centerline(fea_upper, fea_lower)
+
+        # Interpolate target centerline onto FEA centerline s-grid
+        y_tgt_on_fea = np.interp(
+            fea_center["s"],
+            tgt_center["s"],
+            tgt_center["y_center"]
+        )
+
+        # Align and compute error
+        y_fea_aligned, correction = align_curve(
+            fea_center["y_center"].to_numpy(),
+            y_tgt_on_fea,
+            fea_center["s"].to_numpy(),
+            ALIGNMENT_MODE
+        )
+
+        fea_center["y_center_aligned"] = y_fea_aligned
+        fea_center["alignment_correction"] = correction
+
+        err_mm = y_fea_aligned - y_tgt_on_fea
+        err_c = err_mm / TARGET_CHORD_MM
+
+        if SAVE_POINTWISE_CSVS:
+            out_df = fea_center.copy()
+            out_df["y_target_on_fea_mm"] = y_tgt_on_fea
+            out_df["dy_mm"] = err_mm
+            out_df["dy_c"] = err_c
+            out_df.to_csv(OUT_DIR / f"{case_label}_centerline_pointwise.csv", index=False)
+
+        summary_rows.append({
+            "Case": case_label,
+            "ALIGNMENT_MODE": ALIGNMENT_MODE,
+            "FEA_Chord_mm": FEA_CHORD_MM,
+            "Target_Chord_mm": TARGET_CHORD_MM,
+            "Scale_FEA_to_Target": SCALE_FEA_TO_TARGET,
+            "Upper_X_Shift_mm": upper_x_shift,
+            "Lower_X_Shift_mm": lower_x_shift,
+            "Upper_Y_Shift_mm": upper_y_shift,
+            "Lower_Y_Shift_mm": lower_y_shift,
+            "Centerline_RMS_mm": rms(err_mm),
+            "Centerline_MaxAbs_mm": max_abs(err_mm),
+            "Centerline_RMS_y_over_c": rms(err_c),
+            "Centerline_MaxAbs_y_over_c": max_abs(err_c),
+            "N_centerline_points": len(err_mm),
+            "Upper_CSV": upper_csv_path.name,
+            "Lower_CSV": lower_csv_path.name,
+            "Target_File": target_filename,
+        })
+
+        if SAVE_PLOTS:
+            make_centerline_overlay_plot(
+                case_label,
+                tgt_center,
+                fea_center,
+                OUT_DIR / f"{case_label}_centerline_overlay.png"
+            )
+
+            make_centerline_error_plot(
+                case_label,
+                fea_center,
+                err_c,
+                OUT_DIR / f"{case_label}_centerline_error.png"
+            )
+
+    summary = pd.DataFrame(summary_rows)
+    summary_path = OUT_DIR / "centerline_rms_summary.csv"
+    summary.to_csv(summary_path, index=False)
+
+    if SAVE_PLOTS:
+        make_centerline_rms_vs_deflection_plot(
+            summary,
+            OUT_DIR / "centerline_rms_vs_deflection_angle.png"
+        )
+
+    print("Done.")
+    print(f"Summary: {summary_path}")
+    if SAVE_PLOTS:
+        print(f"RMS plot: {OUT_DIR / 'centerline_rms_vs_deflection_angle.png'}")
+
+if __name__ == "__main__":
+    main()
