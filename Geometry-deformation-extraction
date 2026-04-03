@@ -1,0 +1,141 @@
+from odbAccess import openOdb
+import os
+import csv
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+ODB_PATH = r"C:\Users\sebsa\Desktop\Abaqus-Work\FYP2\diagonal-disp.odb"
+STEP_NAME = "deformation"
+OUT_DIR = r"C:\Users\sebsa\Desktop\Abaqus-Work\FYP2\extracted_cases"
+
+TOTAL_DISP_MM = 33.0
+
+REQUESTED_SET_NAMES = ["Upper-nodes", "Lower-nodes", "TE-node"]
+
+CASES = [
+    ("5deg",  2.75),
+    ("10deg", 6.88),
+    ("15deg", 13.21),
+    ("20deg", 19.28),
+    ("25deg", 24.76),
+    ("30deg", 33.00),
+]
+
+# ============================================================
+# HELPERS
+# ============================================================
+def norm_name(s):
+    return s.strip().upper().replace("-", "_").replace(" ", "_")
+
+def safe_name(s):
+    return norm_name(s)
+
+def closest_frame_index_and_time(step, target_time):
+    best_idx = None
+    best_time = None
+    best_diff = None
+
+    for i, frame in enumerate(step.frames):
+        t = frame.frameValue
+        diff = abs(t - target_time)
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best_idx = i
+            best_time = t
+
+    return best_idx, best_time
+
+def find_matching_assembly_set(assembly, requested_name):
+    target = norm_name(requested_name)
+    for actual_name in assembly.nodeSets.keys():
+        if norm_name(actual_name) == target:
+            return actual_name
+    return None
+
+def export_set_for_frame(odb, step, frame_idx, frame_time, requested_set_name, case_label, out_dir):
+    assembly = odb.rootAssembly
+    actual_set_name = find_matching_assembly_set(assembly, requested_set_name)
+
+    if actual_set_name is None:
+        print("WARNING: Could not find assembly node set matching '{}'".format(requested_set_name))
+        return
+
+    node_set = assembly.nodeSets[actual_set_name]
+    frame = step.frames[frame_idx]
+    u_field = frame.fieldOutputs["U"]
+    u_subset = u_field.getSubset(region=node_set)
+
+    # displacement lookup by (instance name, node label)
+    disp_by_key = {}
+    for val in u_subset.values:
+        disp_by_key[(val.instance.name, val.nodeLabel)] = val.data
+
+    filename = "{}_{}_frame{:03d}_time{:.6f}.csv".format(
+        safe_name(case_label), safe_name(actual_set_name), frame_idx, frame_time
+    )
+    out_path = os.path.join(out_dir, filename)
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Case", "RequestedSet", "ActualSet", "FrameIndex", "FrameTime",
+            "Instance", "NodeLabel", "X", "Y", "U1", "U2", "X_def", "Y_def"
+        ])
+
+        # Assembly-level ODB sets return node arrays, so loop two levels
+        for node_array in node_set.nodes:
+            for node in node_array:
+                inst_name = node.instanceName if hasattr(node, "instanceName") else ""
+                label = node.label
+                x = node.coordinates[0]
+                y = node.coordinates[1]
+
+                data = disp_by_key.get((inst_name, label), None)
+                if data is None:
+                    u1, u2 = 0.0, 0.0
+                else:
+                    u1, u2 = data[0], data[1]
+
+                writer.writerow([
+                    case_label, requested_set_name, actual_set_name, frame_idx, frame_time,
+                    inst_name, label, x, y, u1, u2, x + u1, y + u2
+                ])
+
+    print("Wrote:", out_path)
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    if not os.path.exists(OUT_DIR):
+        os.makedirs(OUT_DIR)
+
+    odb = openOdb(path=ODB_PATH, readOnly=True)
+
+    try:
+        step = odb.steps[STEP_NAME]
+
+        print("Available assembly node sets:")
+        for k in odb.rootAssembly.nodeSets.keys():
+            print("  ", k)
+        print("")
+
+        for case_label, disp_mm in CASES:
+            target_time = disp_mm / TOTAL_DISP_MM
+            frame_idx, frame_time = closest_frame_index_and_time(step, target_time)
+
+            print("Case: {} | target disp = {:.3f} mm | target time = {:.6f} | closest frame = {} | frame time = {:.6f}".format(
+                case_label, disp_mm, target_time, frame_idx, frame_time
+            ))
+
+            for set_name in REQUESTED_SET_NAMES:
+                export_set_for_frame(odb, step, frame_idx, frame_time, set_name, case_label, OUT_DIR)
+
+            print("")
+
+    finally:
+        odb.close()
+
+if __name__ == "__main__":
+    main()
