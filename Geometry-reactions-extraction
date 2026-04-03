@@ -1,0 +1,330 @@
+from odbAccess import openOdb
+import os
+import csv
+import math
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+ODB_PATH = r"C:\Users\sebsa\Desktop\Abaqus-Work\FYP2\diagonal-disp.odb"
+STEP_NAME = "deformation"
+OUT_DIR = r"C:\Users\sebsa\Desktop\Abaqus-Work\FYP2\extracted_cases"
+
+TOTAL_DISP_MM = 33.0
+
+# Surface node sets to export
+REQUESTED_SET_NAMES = ["Upper-nodes", "Lower-nodes", "TE-node"]
+
+# Cases based on your rack displacement mapping
+CASES = [
+    ("5DEG",  2.75),
+    ("10DEG", 6.88),
+    ("15DEG", 13.21),
+    ("20DEG", 19.28),
+    ("25DEG", 24.76),
+    ("30DEG", 33.00),
+]
+
+# ============================================================
+# HELPERS
+# ============================================================
+def norm_text(s):
+    return s.upper().replace("-", "_").replace(" ", "_")
+
+def safe_name(s):
+    return norm_text(s)
+
+def closest_frame_index_and_time(step, target_time):
+    best_idx = None
+    best_time = None
+    best_diff = None
+
+    for i, frame in enumerate(step.frames):
+        t = frame.frameValue
+        diff = abs(t - target_time)
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best_idx = i
+            best_time = t
+
+    return best_idx, best_time
+
+def find_matching_assembly_set(assembly, requested_name):
+    target = norm_text(requested_name)
+    for actual_name in assembly.nodeSets.keys():
+        if norm_text(actual_name) == target:
+            return actual_name
+    return None
+
+# ============================================================
+# FIELD OUTPUT EXPORT FOR SKIN / TE NODE SETS
+# ============================================================
+def export_set_for_frame(odb, step, frame_idx, frame_time, requested_set_name, case_label, out_dir):
+    assembly = odb.rootAssembly
+    actual_set_name = find_matching_assembly_set(assembly, requested_set_name)
+
+    if actual_set_name is None:
+        print("WARNING: Could not find assembly node set matching '{}'".format(requested_set_name))
+        return
+
+    node_set = assembly.nodeSets[actual_set_name]
+    frame = step.frames[frame_idx]
+
+    if "U" not in frame.fieldOutputs.keys():
+        print("WARNING: No displacement field 'U' in frame {}".format(frame_idx))
+        return
+
+    u_field = frame.fieldOutputs["U"]
+    u_subset = u_field.getSubset(region=node_set)
+
+    # lookup by (instance, node label)
+    disp_by_key = {}
+    for val in u_subset.values:
+        disp_by_key[(val.instance.name, val.nodeLabel)] = val.data
+
+    filename = "{}_{}_frame{:03d}_time{:.6f}.csv".format(
+        safe_name(case_label), safe_name(actual_set_name), frame_idx, frame_time
+    )
+    out_path = os.path.join(out_dir, filename)
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Case", "RequestedSet", "ActualSet", "FrameIndex", "FrameTime",
+            "Instance", "NodeLabel", "X", "Y", "U1", "U2", "X_def", "Y_def"
+        ])
+
+        # assembly-level odb sets return node arrays
+        for node_array in node_set.nodes:
+            for node in node_array:
+                inst_name = node.instanceName if hasattr(node, "instanceName") else ""
+                label = node.label
+                x = node.coordinates[0]
+                y = node.coordinates[1]
+
+                data = disp_by_key.get((inst_name, label), None)
+                if data is None:
+                    u1, u2 = 0.0, 0.0
+                else:
+                    u1 = data[0]
+                    u2 = data[1]
+
+                writer.writerow([
+                    case_label, requested_set_name, actual_set_name, frame_idx, frame_time,
+                    inst_name, label, x, y, u1, u2, x + u1, y + u2
+                ])
+
+    print("Wrote:", out_path)
+
+# ============================================================
+# HISTORY OUTPUT EXPORT FOR DISPLACEMENT RP
+# ============================================================
+def get_history_region_for_rp(step):
+    """
+    The RP history region was identified as: Node ASSEMBLY.1
+    """
+    target_key = "Node ASSEMBLY.1"
+    if target_key in step.historyRegions:
+        return target_key, step.historyRegions[target_key]
+    return None, None
+
+def find_history_output(region, var_name):
+    """
+    Find RF1/RF2/U1/U2 in the RP history region.
+    """
+    target = var_name.upper()
+    for key, ho in region.historyOutputs.items():
+        if key.upper() == target:
+            return key, ho
+    for key, ho in region.historyOutputs.items():
+        if target in key.upper():
+            return key, ho
+    return None, None
+
+
+def export_rp_history(step, out_dir):
+    region_key, region = get_history_region_for_rp(step)
+
+    if region is None:
+        print("WARNING: Could not find history region for DISP-RP")
+        print("Available history regions and outputs:")
+        for k, r in step.historyRegions.items():
+            print("REGION:", k)
+            for hk in r.historyOutputs.keys():
+                print("   ", hk)
+        return
+
+    print("Using RP history region:", region_key)
+
+    rf1_key, rf1_obj = find_history_output(region, "RF1")
+    rf2_key, rf2_obj = find_history_output(region, "RF2")
+    u1_key, u1_obj  = find_history_output(region, "U1")
+    u2_key, u2_obj  = find_history_output(region, "U2")
+
+    print("Matched history outputs:")
+    print("   RF1:", rf1_key)
+    print("   RF2:", rf2_key)
+    print("   U1 :", u1_key)
+    print("   U2 :", u2_key)
+
+    time_dict = {}
+
+    def add_series(obj, name):
+        if obj is None:
+            return
+        for t, v in obj.data:
+            if t not in time_dict:
+                time_dict[t] = {}
+            time_dict[t][name] = v
+
+    add_series(rf1_obj, "RF1")
+    add_series(rf2_obj, "RF2")
+    add_series(u1_obj, "U1")
+    add_series(u2_obj, "U2")
+
+    if not time_dict:
+        print("WARNING: No RP history data found in DISP-RP region.")
+        print("Available outputs in region:")
+        for k in region.historyOutputs.keys():
+            print("  ", k)
+        return
+
+    times = sorted(time_dict.keys())
+
+    out_path = os.path.join(out_dir, "RP_HISTORY_DISP_RP.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["StepTime", "U1", "U2", "RF1", "RF2", "U_mag", "RF_mag"])
+
+        for t in times:
+            row = time_dict[t]
+            u1 = row.get("U1", 0.0)
+            u2 = row.get("U2", 0.0)
+            rf1 = row.get("RF1", 0.0)
+            rf2 = row.get("RF2", 0.0)
+            u_mag = math.sqrt(u1*u1 + u2*u2)
+            rf_mag = math.sqrt(rf1*rf1 + rf2*rf2)
+
+            writer.writerow([t, u1, u2, rf1, rf2, u_mag, rf_mag])
+
+    print("Wrote:", out_path)
+
+def export_rp_case_summary(step, cases, total_disp_mm, out_dir):
+    region_key, region = get_history_region_for_rp(step)
+
+    if region is None:
+        print("WARNING: Could not find history region for DISP-RP")
+        return
+
+    _, rf1_obj = find_history_output(region, "RF1")
+    _, rf2_obj = find_history_output(region, "RF2")
+    _, u1_obj  = find_history_output(region, "U1")
+    _, u2_obj  = find_history_output(region, "U2")
+
+    def series_to_dict(obj):
+        d = {}
+        if obj is not None:
+            for t, v in obj.data:
+                d[t] = v
+        return d
+
+    rf1_d = series_to_dict(rf1_obj)
+    rf2_d = series_to_dict(rf2_obj)
+    u1_d = series_to_dict(u1_obj)
+    u2_d = series_to_dict(u2_obj)
+
+    all_times = sorted(set(rf1_d.keys()) | set(rf2_d.keys()) | set(u1_d.keys()) | set(u2_d.keys()))
+    if not all_times:
+        print("WARNING: No RP history data available for case summary.")
+        return
+
+    def closest_time(target_time):
+        best_t = None
+        best_diff = None
+        for t in all_times:
+            diff = abs(t - target_time)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_t = t
+        return best_t
+
+    out_path = os.path.join(out_dir, "RP_CASE_SUMMARY_DISP_RP.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Case", "TargetDisp_mm", "TargetTime", "MatchedTime",
+            "U1", "U2", "RF1", "RF2", "U_mag", "RF_mag"
+        ])
+
+        for case_label, disp_mm in cases:
+            target_time = disp_mm / total_disp_mm
+            t = closest_time(target_time)
+
+            u1 = u1_d.get(t, 0.0)
+            u2 = u2_d.get(t, 0.0)
+            rf1 = rf1_d.get(t, 0.0)
+            rf2 = rf2_d.get(t, 0.0)
+            u_mag = math.sqrt(u1*u1 + u2*u2)
+            rf_mag = math.sqrt(rf1*rf1 + rf2*rf2)
+
+            writer.writerow([
+                case_label, disp_mm, target_time, t,
+                u1, u2, rf1, rf2, u_mag, rf_mag
+            ])
+
+    print("Wrote:", out_path)
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    if not os.path.exists(OUT_DIR):
+        os.makedirs(OUT_DIR)
+
+    odb = openOdb(path=ODB_PATH, readOnly=True)
+
+    try:
+        if STEP_NAME not in odb.steps:
+            raise ValueError("Step '{}' not found in ODB.".format(STEP_NAME))
+
+        step = odb.steps[STEP_NAME]
+
+        print("ODB opened:", ODB_PATH)
+        print("Using step:", STEP_NAME)
+        print("Number of frames in step:", len(step.frames))
+        print("")
+
+        # Export skin and TE data for each case
+        for case_label, disp_mm in CASES:
+            target_time = disp_mm / TOTAL_DISP_MM
+            frame_idx, frame_time = closest_frame_index_and_time(step, target_time)
+
+            print("Case: {} | target disp = {:.3f} mm | target time = {:.6f} | closest frame = {} | frame time = {:.6f}".format(
+                case_label, disp_mm, target_time, frame_idx, frame_time
+            ))
+
+            for set_name in REQUESTED_SET_NAMES:
+                export_set_for_frame(
+                    odb=odb,
+                    step=step,
+                    frame_idx=frame_idx,
+                    frame_time=frame_time,
+                    requested_set_name=set_name,
+                    case_label=case_label,
+                    out_dir=OUT_DIR
+                )
+
+            print("")
+
+        # Export RP reaction/displacement history
+        export_rp_history(step, OUT_DIR)
+
+        # Export RP values at the six target cases
+        export_rp_case_summary(step, CASES, TOTAL_DISP_MM, OUT_DIR)
+
+    finally:
+        odb.close()
+        print("ODB closed.")
+
+if __name__ == "__main__":
+    main()
