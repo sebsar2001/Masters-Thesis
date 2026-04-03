@@ -1,0 +1,417 @@
+from odbAccess import openOdb
+import os
+import csv
+import math
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+ODB_PATH = r"C:\Users\sebsa\Desktop\Abaqus-Work\FYP2\spring-rib.odb"
+STEP_NAME = "displacement"
+OUT_DIR = r"C:\Users\sebsa\Desktop\Abaqus-Work\FYP2\spring_rib_exports"
+
+# Assembly node sets
+UPPER_SET_NAME = "UPPER-SURF"
+LOWER_SET_NAME = "LOWER-SURF"
+TE_SET_NAME = "TE-NODE"
+
+# RP history region
+RP_HISTORY_REGION = "Node ASSEMBLY.2"
+
+# Hinge / start of deformable region
+HINGE_X_MM = 200.0
+HINGE_Y_MM = 0.0
+
+# Target effective angles to match
+TARGET_CASES = [
+    {"case": "REF_5DEG",  "target_angle_deg": 5.0},
+    {"case": "REF_10DEG", "target_angle_deg": 10.0},
+    {"case": "REF_15DEG", "target_angle_deg": 15.0},
+    {"case": "REF_20DEG", "target_angle_deg": 20.0},
+    {"case": "REF_25DEG", "target_angle_deg": 25.0},
+    {"case": "REF_30DEG", "target_angle_deg": 30.0},
+]
+
+# ============================================================
+# HELPERS
+# ============================================================
+def norm_text(s):
+    return s.upper().replace("-", "_").replace(" ", "_")
+
+def safe_name(s):
+    return norm_text(s)
+
+def find_matching_assembly_set(assembly, requested_name):
+    target = norm_text(requested_name)
+    for actual_name in assembly.nodeSets.keys():
+        if norm_text(actual_name) == target:
+            return actual_name
+    return None
+
+def find_history_output(region, var_name):
+    target = norm_text(var_name)
+    for key, ho in region.historyOutputs.items():
+        if norm_text(key) == target:
+            return key, ho
+    for key, ho in region.historyOutputs.items():
+        if target in norm_text(key):
+            return key, ho
+    return None, None
+
+def effective_angle_deg(x_te, y_te, x_hinge, y_hinge):
+    dx = x_te - x_hinge
+    dy = y_hinge - y_te   # downward deflection -> positive angle
+    return math.degrees(math.atan2(dy, dx))
+
+# ============================================================
+# TE TRACKING
+# ============================================================
+def get_te_track(step, assembly, te_set_name):
+    actual_name = find_matching_assembly_set(assembly, te_set_name)
+    if actual_name is None:
+        raise ValueError("Could not find TE node set matching '{}'".format(te_set_name))
+
+    te_set = assembly.nodeSets[actual_name]
+
+    te_nodes = []
+    for node_array in te_set.nodes:
+        for node in node_array:
+            te_nodes.append(node)
+
+    if len(te_nodes) == 0:
+        raise ValueError("TE node set '{}' is empty".format(actual_name))
+
+    if len(te_nodes) > 1:
+        print("WARNING: TE set '{}' has {} nodes. Using the first one.".format(actual_name, len(te_nodes)))
+
+    te_node = te_nodes[0]
+    te_label = te_node.label
+    x0 = te_node.coordinates[0]
+    y0 = te_node.coordinates[1]
+
+    te_track = []
+
+    for i, frame in enumerate(step.frames):
+        if "U" not in frame.fieldOutputs:
+            continue
+
+        u_field = frame.fieldOutputs["U"]
+        u_subset = u_field.getSubset(region=te_set)
+
+        u1 = 0.0
+        u2 = 0.0
+        found = False
+
+        for val in u_subset.values:
+            if val.nodeLabel == te_label:
+                u1 = val.data[0]
+                u2 = val.data[1]
+                found = True
+                break
+
+        if not found and len(u_subset.values) == 1:
+            u1 = u_subset.values[0].data[0]
+            u2 = u_subset.values[0].data[1]
+            found = True
+
+        if not found:
+            print("WARNING: TE displacement not found in frame {}; using zero.".format(i))
+
+        x_def = x0 + u1
+        y_def = y0 + u2
+        angle_deg = effective_angle_deg(x_def, y_def, HINGE_X_MM, HINGE_Y_MM)
+
+        te_track.append({
+            "frame_idx": i,
+            "frame_time": frame.frameValue,
+            "x0": x0,
+            "y0": y0,
+            "u1": u1,
+            "u2": u2,
+            "x_def": x_def,
+            "y_def": y_def,
+            "eff_angle_deg": angle_deg,
+        })
+
+    return actual_name, te_node, te_track
+
+def choose_frame_by_target_angle(te_track, target_angle_deg):
+    best = None
+    best_metric = None
+
+    for row in te_track:
+        metric = abs(row["eff_angle_deg"] - target_angle_deg)
+        if best_metric is None or metric < best_metric:
+            best_metric = metric
+            best = dict(row)
+            best["angle_match_error_deg"] = metric
+
+    return best
+
+def export_te_track(te_track, out_dir):
+    out_path = os.path.join(out_dir, "TE_TRACK.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "FrameIndex", "FrameTime", "X", "Y", "U1", "U2", "X_def", "Y_def", "EffectiveAngle_deg"
+        ])
+        for row in te_track:
+            writer.writerow([
+                row["frame_idx"], row["frame_time"],
+                row["x0"], row["y0"], row["u1"], row["u2"], row["x_def"], row["y_def"], row["eff_angle_deg"]
+            ])
+    print("Wrote:", out_path)
+
+# ============================================================
+# NODAL EXPORT
+# ============================================================
+def export_set_for_frame(odb, step, frame_idx, frame_time, requested_set_name, case_label, out_dir):
+    assembly = odb.rootAssembly
+    actual_set_name = find_matching_assembly_set(assembly, requested_set_name)
+
+    if actual_set_name is None:
+        print("WARNING: Could not find node set matching '{}'".format(requested_set_name))
+        return
+
+    node_set = assembly.nodeSets[actual_set_name]
+    frame = step.frames[frame_idx]
+
+    if "U" not in frame.fieldOutputs.keys():
+        print("WARNING: No displacement field 'U' in frame {}".format(frame_idx))
+        return
+
+    u_field = frame.fieldOutputs["U"]
+    u_subset = u_field.getSubset(region=node_set)
+
+    disp_by_key = {}
+    for val in u_subset.values:
+        inst_name = ""
+        try:
+            inst_name = val.instance.name
+        except Exception:
+            inst_name = ""
+        disp_by_key[(inst_name, val.nodeLabel)] = val.data
+
+    filename = "{}_{}_frame{:03d}_time{:.6f}.csv".format(
+        safe_name(case_label), safe_name(actual_set_name), frame_idx, frame_time
+    )
+    out_path = os.path.join(out_dir, filename)
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Case", "RequestedSet", "ActualSet", "FrameIndex", "FrameTime",
+            "Instance", "NodeLabel", "X", "Y", "U1", "U2", "X_def", "Y_def"
+        ])
+
+        for node_array in node_set.nodes:
+            for node in node_array:
+                inst_name = node.instanceName if hasattr(node, "instanceName") else ""
+                label = node.label
+                x = node.coordinates[0]
+                y = node.coordinates[1]
+
+                data = disp_by_key.get((inst_name, label), None)
+
+                if data is None:
+                    for key, value in disp_by_key.items():
+                        _, key_label = key
+                        if key_label == label:
+                            data = value
+                            break
+
+                if data is None:
+                    u1, u2 = 0.0, 0.0
+                else:
+                    u1, u2 = data[0], data[1]
+
+                writer.writerow([
+                    case_label, requested_set_name, actual_set_name, frame_idx, frame_time,
+                    inst_name, label, x, y, u1, u2, x + u1, y + u2
+                ])
+
+    print("Wrote:", out_path)
+
+# ============================================================
+# RP HISTORY EXPORT
+# ============================================================
+def export_rp_history(step, out_dir):
+    if RP_HISTORY_REGION not in step.historyRegions:
+        raise ValueError("Could not find RP history region '{}'".format(RP_HISTORY_REGION))
+
+    region = step.historyRegions[RP_HISTORY_REGION]
+
+    rf1_key, rf1_obj = find_history_output(region, "RF1")
+    rf2_key, rf2_obj = find_history_output(region, "RF2")
+    u1_key,  u1_obj  = find_history_output(region, "U1")
+    u2_key,  u2_obj  = find_history_output(region, "U2")
+
+    print("Using RP history region:", RP_HISTORY_REGION)
+    print("Matched history outputs:")
+    print("   RF1:", rf1_key)
+    print("   RF2:", rf2_key)
+    print("   U1 :", u1_key)
+    print("   U2 :", u2_key)
+
+    time_dict = {}
+
+    def add_series(obj, name):
+        if obj is None:
+            return
+        for t, v in obj.data:
+            if t not in time_dict:
+                time_dict[t] = {}
+            time_dict[t][name] = v
+
+    add_series(rf1_obj, "RF1")
+    add_series(rf2_obj, "RF2")
+    add_series(u1_obj, "U1")
+    add_series(u2_obj, "U2")
+
+    if not time_dict:
+        raise ValueError("No RP history data found in '{}'".format(RP_HISTORY_REGION))
+
+    times = sorted(time_dict.keys())
+
+    out_path = os.path.join(out_dir, "RP_HISTORY_DISP_RP.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["StepTime", "U1", "U2", "RF1", "RF2", "U_mag", "RF_mag"])
+
+        for t in times:
+            row = time_dict[t]
+            u1 = row.get("U1", 0.0)
+            u2 = row.get("U2", 0.0)
+            rf1 = row.get("RF1", 0.0)
+            rf2 = row.get("RF2", 0.0)
+            u_mag = math.sqrt(u1 * u1 + u2 * u2)
+            rf_mag = math.sqrt(rf1 * rf1 + rf2 * rf2)
+
+            writer.writerow([t, u1, u2, rf1, rf2, u_mag, rf_mag])
+
+    print("Wrote:", out_path)
+    return time_dict
+
+# ============================================================
+# CASE SUMMARY
+# ============================================================
+def export_case_summary_by_angle(te_track, rp_time_dict, target_cases, out_dir):
+    out_path = os.path.join(out_dir, "CASE_SUMMARY_BY_ANGLE.csv")
+
+    rp_times = sorted(rp_time_dict.keys())
+    if not rp_times:
+        raise ValueError("No RP time history available")
+
+    def closest_rp_time(target_time):
+        best_t = None
+        best_diff = None
+        for t in rp_times:
+            diff = abs(t - target_time)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best_t = t
+        return best_t
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Case",
+            "TargetAngle_deg",
+            "MatchedFrame", "MatchedTime",
+            "Matched_X_TE", "Matched_Y_TE",
+            "MatchedAngle_deg",
+            "AngleMatchError_deg",
+            "U1_RP", "U2_RP", "RF1_RP", "RF2_RP", "U_mag_RP", "RF_mag_RP"
+        ])
+
+        for case in target_cases:
+            best = choose_frame_by_target_angle(te_track, case["target_angle_deg"])
+
+            t_rp = closest_rp_time(best["frame_time"])
+            rp_row = rp_time_dict[t_rp]
+
+            u1 = rp_row.get("U1", 0.0)
+            u2 = rp_row.get("U2", 0.0)
+            rf1 = rp_row.get("RF1", 0.0)
+            rf2 = rp_row.get("RF2", 0.0)
+            u_mag = math.sqrt(u1 * u1 + u2 * u2)
+            rf_mag = math.sqrt(rf1 * rf1 + rf2 * rf2)
+
+            writer.writerow([
+                case["case"],
+                case["target_angle_deg"],
+                best["frame_idx"], best["frame_time"],
+                best["x_def"], best["y_def"],
+                best["eff_angle_deg"],
+                best["angle_match_error_deg"],
+                u1, u2, rf1, rf2, u_mag, rf_mag
+            ])
+
+    print("Wrote:", out_path)
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    if not os.path.exists(OUT_DIR):
+        os.makedirs(OUT_DIR)
+
+    odb = openOdb(path=ODB_PATH, readOnly=True)
+
+    try:
+        if STEP_NAME not in odb.steps:
+            raise ValueError("Step '{}' not found in ODB.".format(STEP_NAME))
+
+        step = odb.steps[STEP_NAME]
+        assembly = odb.rootAssembly
+
+        print("ODB opened:", ODB_PATH)
+        print("Using step:", STEP_NAME)
+        print("Number of frames in step:", len(step.frames))
+        print("")
+
+        rp_time_dict = export_rp_history(step, OUT_DIR)
+        print("")
+
+        te_actual_name, te_node, te_track = get_te_track(step, assembly, TE_SET_NAME)
+        print("Using TE set:", te_actual_name)
+        print("Using TE node label:", te_node.label)
+
+        export_te_track(te_track, OUT_DIR)
+        print("")
+
+        for case in TARGET_CASES:
+            best = choose_frame_by_target_angle(te_track, case["target_angle_deg"])
+
+            print(
+                "Case: {} | target angle={:.6f} deg | matched frame={} | matched time={:.6f} | "
+                "matched angle={:.6f} deg | error={:.6f} deg".format(
+                    case["case"],
+                    case["target_angle_deg"],
+                    best["frame_idx"], best["frame_time"],
+                    best["eff_angle_deg"],
+                    best["angle_match_error_deg"]
+                )
+            )
+
+            for set_name in [UPPER_SET_NAME, LOWER_SET_NAME, TE_SET_NAME]:
+                export_set_for_frame(
+                    odb=odb,
+                    step=step,
+                    frame_idx=best["frame_idx"],
+                    frame_time=best["frame_time"],
+                    requested_set_name=set_name,
+                    case_label=case["case"],
+                    out_dir=OUT_DIR
+                )
+
+            print("")
+
+        export_case_summary_by_angle(te_track, rp_time_dict, TARGET_CASES, OUT_DIR)
+
+    finally:
+        odb.close()
+        print("ODB closed.")
+
+if __name__ == "__main__":
+    main()
